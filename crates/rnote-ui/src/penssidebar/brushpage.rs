@@ -463,13 +463,18 @@ impl RnBrushPage {
                 };
                 if let Some(canvas) = appwindow.active_tab_canvas() {
                     if needs_seed {
-                        // The ruler position is in scroller (window-relative) pixels —
-                        // seed it to the center of the visible viewport.
-                        let center_scroller = canvas.engine_ref().camera.size() * 0.5;
+                        // The ruler position is in window coordinates — seed it to the center
+                        // of the visible area, which is what the canvas wrapper covers.
+                        let center_window = appwindow
+                            .active_tab_wrapper()
+                            .map(|w| {
+                                p2d::math::Vector2::new(w.width() as f64, w.height() as f64) * 0.5
+                            })
+                            .unwrap_or_else(|| canvas.engine_ref().camera.size() * 0.5);
                         let mut c = appwindow.engine_config().write();
                         let r = &mut c.pens_config.brush_config.ruler_config;
-                        r.anchor = center_scroller;
-                        r.dial_pos = center_scroller;
+                        r.anchor = center_window;
+                        r.dial_pos = center_window;
                     }
                     canvas.queue_draw();
                 }

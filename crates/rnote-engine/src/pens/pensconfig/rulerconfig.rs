@@ -1,14 +1,52 @@
 // Imports
+use crate::Camera;
 use p2d::math::Vector2;
 use serde::{Deserialize, Serialize};
+
+/// The mapping between the window coordinates the ruler lives in and document coordinates.
+///
+/// The ruler stays where it is on screen while the canvas is panned or zoomed, so its position is
+/// kept in window coordinates. Those are not the canvas surface coordinates the camera works in:
+/// in the bounded layouts the canvas is only as large as the document and is centered in the
+/// window, so the two are offset by a margin that changes with the zoom.
+#[derive(Clone, Copy, Debug)]
+pub struct RulerView {
+    surface_origin: Vector2,
+    camera_offset: Vector2,
+    total_zoom: f64,
+}
+
+impl RulerView {
+    pub fn from_camera(camera: &Camera) -> Self {
+        Self {
+            surface_origin: camera.surface_origin(),
+            camera_offset: camera.offset(),
+            total_zoom: camera.total_zoom(),
+        }
+    }
+
+    pub fn total_zoom(&self) -> f64 {
+        self.total_zoom
+    }
+
+    /// Convert a position from window coordinates to document coordinates.
+    pub fn to_doc(&self, window_pos: Vector2) -> Vector2 {
+        (window_pos - self.surface_origin + self.camera_offset) / self.total_zoom
+    }
+
+    /// Convert a position from document coordinates to window coordinates.
+    pub fn from_doc(&self, doc_pos: Vector2) -> Vector2 {
+        doc_pos * self.total_zoom - self.camera_offset + self.surface_origin
+    }
+}
 
 /// Configuration and runtime state for the on-canvas ruler.
 ///
 /// The ruler is a translucent straight-edge spanning the viewport. Position is
-/// stored in **scroller (window-relative) coordinates** — i.e. pixel offsets
-/// inside the visible viewport — so panning or zooming the canvas does not
-/// move the ruler on screen. Conversions to document coordinates are performed
-/// on demand via [`Self::pos_to_doc`] / [`Self::pos_from_doc`].
+/// stored in **window coordinates**, so the ruler stays where it is on screen
+/// while the canvas is panned or zoomed, like a straight-edge held against the
+/// screen. Conversions to document coordinates go through [`RulerView`], which
+/// accounts for where the canvas sits inside the window.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename = "ruler_config")]
 pub struct RulerConfig {
@@ -19,13 +57,11 @@ pub struct RulerConfig {
     /// Angle of the ruler's long axis in radians (0 = horizontal). In-session only.
     #[serde(skip)]
     pub angle: f64,
-    /// A point in scroller (window-relative) pixel coordinates the ruler
-    /// centerline passes through. Defines the origin for tick marks. The
-    /// ruler is fixed relative to the window — this does not change as the
-    /// canvas is panned or zoomed. In-session only.
+    /// A point in window coordinates the ruler centerline passes through.
+    /// Defines the origin for tick marks. In-session only.
     #[serde(skip)]
     pub anchor: Vector2,
-    /// Where the angle dial / rotation pivot is rendered, in scroller
+    /// Where the angle dial / rotation pivot is rendered, in window
     /// coordinates. Always lies on the centerline. Distinct from `anchor` so
     /// the dial can move (e.g., to the finger centroid) without shifting the
     /// tick origin. In-session only.
@@ -176,49 +212,41 @@ impl RulerConfig {
         }
     }
 
-    /// Convert a position from window-relative surface pixels to document coordinates.
-    pub fn pos_to_doc(surface_pos: Vector2, camera_offset: Vector2, total_zoom: f64) -> Vector2 {
-        // Surface here is the canvas widget's local coord system, which has its
-        // origin at the top-left of the visible viewport (the canvas widget
-        // implements Scrollable internally — there's no scroll-offset between
-        // the scroller widget and the canvas widget). So this is just the
-        // standard inverse of the camera transform.
-        (surface_pos + camera_offset) / total_zoom
-    }
-
-    /// Convert a position from document coordinates to window-relative surface pixels.
-    pub fn pos_from_doc(doc_pos: Vector2, camera_offset: Vector2, total_zoom: f64) -> Vector2 {
-        doc_pos * total_zoom - camera_offset
-    }
-
     /// Ruler centerline anchor in document coordinates.
-    pub fn anchor_doc(&self, camera_offset: Vector2, total_zoom: f64) -> Vector2 {
-        Self::pos_to_doc(self.anchor, camera_offset, total_zoom)
+    pub fn anchor_doc(&self, view: RulerView) -> Vector2 {
+        view.to_doc(self.anchor)
     }
 
     /// Dial position in document coordinates.
-    pub fn dial_pos_doc(&self, camera_offset: Vector2, total_zoom: f64) -> Vector2 {
-        Self::pos_to_doc(self.dial_pos, camera_offset, total_zoom)
+    pub fn dial_pos_doc(&self, view: RulerView) -> Vector2 {
+        view.to_doc(self.dial_pos)
+    }
+
+    /// Signed distance of a position in window coordinates from the centerline.
+    fn perp_distance(&self, window_pos: Vector2) -> f64 {
+        (window_pos - self.anchor).dot(self.normal())
+    }
+
+    /// Whether `window_pos` (in window coordinates) lies within the ruler body strip.
+    pub fn hit_body_window(&self, window_pos: Vector2) -> bool {
+        if !self.visible {
+            return false;
+        }
+
+        self.perp_distance(window_pos).abs() <= self.body_half_width
     }
 
     /// If `pos_doc` lies within the snap zone of one of the ruler's long
     /// edges, return the sign of the perpendicular (`+1.0` or `-1.0`) that
     /// identifies that edge. `None` means no snap.
-    pub fn snap_side(
-        &self,
-        pos_doc: Vector2,
-        camera_offset: Vector2,
-        total_zoom: f64,
-    ) -> Option<f64> {
+    pub fn snap_side(&self, pos_doc: Vector2, view: RulerView) -> Option<f64> {
         if !self.visible {
             return None;
         }
-        let pos_scroller = Self::pos_from_doc(pos_doc, camera_offset, total_zoom);
         let half_w = self.body_half_width;
-        let snap_dist_px = (self.snap_distance / 100.0) * 2.0 * half_w;
-        let rel = pos_scroller - self.anchor;
-        let perp = rel.dot(self.normal());
-        if perp.abs() - half_w > snap_dist_px {
+        let snap_dist = (self.snap_distance / 100.0) * 2.0 * half_w;
+        let perp = self.perp_distance(view.from_doc(pos_doc));
+        if perp.abs() - half_w > snap_dist {
             None
         } else {
             Some(if perp >= 0.0 { 1.0 } else { -1.0 })
@@ -228,20 +256,14 @@ impl RulerConfig {
     /// Project `pos_doc` onto the long edge identified by `side` (`+1.0` or
     /// `-1.0`), regardless of distance. Used to keep a stroke locked to the
     /// ruler once it has snapped.
-    pub fn project_to_edge(
-        &self,
-        pos_doc: Vector2,
-        side: f64,
-        camera_offset: Vector2,
-        total_zoom: f64,
-    ) -> Vector2 {
-        let pos_scroller = Self::pos_from_doc(pos_doc, camera_offset, total_zoom);
+    pub fn project_to_edge(&self, pos_doc: Vector2, side: f64, view: RulerView) -> Vector2 {
+        let pos_window = view.from_doc(pos_doc);
         let dir = self.direction();
         let normal = self.normal();
-        let along = (pos_scroller - self.anchor).dot(dir);
-        let half_w = self.body_half_width;
-        let snapped_scroller = self.anchor + along * dir + side * half_w * normal;
-        Self::pos_to_doc(snapped_scroller, camera_offset, total_zoom)
+        let along = (pos_window - self.anchor).dot(dir);
+        let snapped_window = self.anchor + along * dir + side * self.body_half_width * normal;
+
+        view.to_doc(snapped_window)
     }
 
     /// Normalize an angle (radians) to the displayable principal angle in
@@ -323,12 +345,89 @@ impl RulerConfig {
 
     /// Whether `pos_doc` (in document coordinates) lies within the ruler body
     /// strip (infinite along the long axis, finite across).
-    pub fn hit_body(&self, pos_doc: Vector2, camera_offset: Vector2, total_zoom: f64) -> bool {
-        if !self.visible {
-            return false;
+    pub fn hit_body(&self, pos_doc: Vector2, view: RulerView) -> bool {
+        self.hit_body_window(view.from_doc(pos_doc))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn horizontal_ruler() -> RulerConfig {
+        RulerConfig {
+            visible: true,
+            angle: 0.0,
+            anchor: Vector2::new(200.0, 150.0),
+            dial_pos: Vector2::new(200.0, 150.0),
+            body_half_width: 60.0,
+            ..RulerConfig::default()
         }
-        let pos_scroller = Self::pos_from_doc(pos_doc, camera_offset, total_zoom);
-        let rel = pos_scroller - self.anchor;
-        rel.dot(self.normal()).abs() <= self.body_half_width
+    }
+
+    /// A view with the canvas offset inside the window, as in the bounded layouts where it is
+    /// only as large as the document and centered.
+    fn view(total_zoom: f64, surface_origin: Vector2) -> RulerView {
+        RulerView {
+            surface_origin,
+            camera_offset: Vector2::new(40.0, 25.0),
+            total_zoom,
+        }
+    }
+
+    #[test]
+    fn window_and_document_conversions_are_inverse() {
+        let view = view(2.5, Vector2::new(120.0, 0.0));
+        let window_pos = Vector2::new(310.0, 180.0);
+
+        assert!((view.from_doc(view.to_doc(window_pos)) - window_pos).length() < 1e-9);
+    }
+
+    #[test]
+    fn body_stays_under_the_same_screen_position() {
+        let ruler = horizontal_ruler();
+        // 50 pixels below the centerline on screen is inside the 60 pixel half width,
+        // no matter the zoom or where the canvas sits inside the window.
+        let window_pos = ruler.anchor + Vector2::new(0.0, 50.0);
+
+        for total_zoom in [0.2, 1.0, 6.0] {
+            for surface_origin in [Vector2::ZERO, Vector2::new(180.0, 40.0)] {
+                let view = view(total_zoom, surface_origin);
+                assert!(
+                    ruler.hit_body(view.to_doc(window_pos), view),
+                    "expected a hit at zoom {total_zoom} with origin {surface_origin:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn project_to_edge_lands_on_the_edge() {
+        let ruler = horizontal_ruler();
+        let view = view(2.5, Vector2::new(120.0, 0.0));
+        let pos_window = Vector2::new(320.0, 190.0);
+
+        let projected = view.from_doc(ruler.project_to_edge(view.to_doc(pos_window), 1.0, view));
+
+        // Keeps its position along the ruler, and sits exactly one half width off the centerline.
+        assert!((projected.x - pos_window.x).abs() < 1e-9);
+        assert!((ruler.perp_distance(projected) - ruler.body_half_width).abs() < 1e-9);
+    }
+
+    #[test]
+    fn snap_zone_reaches_past_the_edge_in_screen_pixels() {
+        let ruler = horizontal_ruler();
+        // The default snap distance is 25% of the full width, so the zone ends half a body
+        // half-width past the edge: 60 + 30 = 90 pixels on screen.
+        for total_zoom in [0.2, 1.0, 6.0] {
+            let view = view(total_zoom, Vector2::new(180.0, 40.0));
+            let at = |offset: f64| {
+                ruler.snap_side(view.to_doc(ruler.anchor + Vector2::new(0.0, offset)), view)
+            };
+
+            assert_eq!(at(85.0), Some(1.0), "zoom {total_zoom}");
+            assert_eq!(at(-85.0), Some(-1.0), "zoom {total_zoom}");
+            assert_eq!(at(95.0), None, "zoom {total_zoom}");
+        }
     }
 }

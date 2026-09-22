@@ -1,5 +1,5 @@
 // Imports
-use crate::pens::pensconfig::rulerconfig::RulerConfig;
+use crate::pens::pensconfig::rulerconfig::{RulerConfig, RulerView};
 use p2d::bounding_volume::Aabb;
 use p2d::math::Vector2;
 use piet::{RenderContext, Text, TextLayout, TextLayoutBuilder};
@@ -58,41 +58,29 @@ fn viewport_t_range(
     Some((min_t - pad, max_t + pad))
 }
 
-/// Bounds of the ruler band on the document, when visible, including a small margin.
-pub fn ruler_bounds_on_doc(ruler: &RulerConfig, viewport: Aabb, total_zoom: f64) -> Option<Aabb> {
-    if !ruler.visible {
-        return None;
-    }
-    let half_w = ruler.body_half_width_doc(total_zoom);
-    let tick = RulerConfig::TICK_MAJOR_LEN_PX / total_zoom;
-    let pad = half_w + tick + 4.0 / total_zoom;
-    Some(Aabb::new(
-        Vector2::new(viewport.mins.x - pad, viewport.mins.y - pad),
-        Vector2::new(viewport.maxs.x + pad, viewport.maxs.y + pad),
-    ))
-}
-
-/// Draw the ruler band across the viewport with tick marks on its long edges
-/// and an angle dial. The ruler's position is stored in scroller coordinates
-/// and converted to document coordinates here using `camera_offset` and
-/// `total_zoom`.
+/// Draw the ruler band across the visible area with tick marks on its long
+/// edges and an angle dial.
+///
+/// `visible_doc` is the whole area visible on screen in document coordinates,
+/// which in the bounded layouts extends past the document itself. The ruler
+/// spans all of it, so it is not cut off outside the page.
 pub fn draw_ruler_on_doc(
     cx: &mut piet_cairo::CairoRenderContext,
     ruler: &RulerConfig,
-    viewport: Aabb,
-    camera_offset: Vector2,
-    total_zoom: f64,
+    visible_doc: Aabb,
+    view: RulerView,
     background_color: &rnote_compose::Color,
 ) -> anyhow::Result<()> {
     if !ruler.visible {
         return Ok(());
     }
+    let total_zoom = view.total_zoom();
     let dark_mode = RulerConfig::dark_mode_for_background(background_color);
-    let anchor_doc = ruler.anchor_doc(camera_offset, total_zoom);
+    let anchor_doc = ruler.anchor_doc(view);
     let dir = ruler.direction();
     let normal = ruler.normal();
     let half_w = ruler.body_half_width_doc(total_zoom);
-    let Some((min_t, max_t)) = viewport_t_range(anchor_doc, dir, half_w, viewport) else {
+    let Some((min_t, max_t)) = viewport_t_range(anchor_doc, dir, half_w, visible_doc) else {
         return Ok(());
     };
 
@@ -161,8 +149,7 @@ pub fn draw_ruler_on_doc(
     }
 
     if ruler.show_dial {
-        let dial_pos_doc = ruler.dial_pos_doc(camera_offset, total_zoom);
-        draw_angle_dial(cx, ruler, dial_pos_doc, total_zoom, dark_mode)?;
+        draw_angle_dial(cx, ruler, ruler.dial_pos_doc(view), total_zoom, dark_mode)?;
     }
 
     cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
@@ -263,4 +250,49 @@ fn draw_angle_dial(
     cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Camera;
+
+    /// Draw the ruler onto a throwaway surface, to check the geometry it produces stays valid.
+    fn draw_at(total_zoom: f64, angle: f64) -> anyhow::Result<()> {
+        let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 400, 300)?;
+        let cairo_cx = cairo::Context::new(&surface)?;
+        let mut piet_cx = piet_cairo::CairoRenderContext::new(&cairo_cx);
+        let ruler = RulerConfig {
+            visible: true,
+            angle,
+            anchor: Vector2::new(200.0, 150.0),
+            dial_pos: Vector2::new(200.0, 150.0),
+            ..RulerConfig::default()
+        };
+        let visible_doc = Aabb::new(
+            Vector2::ZERO,
+            Vector2::new(400.0 / total_zoom, 300.0 / total_zoom),
+        );
+        // The canvas is offset inside the window, as in the bounded layouts.
+        let mut camera = Camera::default().with_zoom(total_zoom);
+        camera.set_surface_origin(Vector2::new(120.0, 0.0));
+
+        draw_ruler_on_doc(
+            &mut piet_cx,
+            &ruler,
+            visible_doc,
+            RulerView::from_camera(&camera),
+            &rnote_compose::Color::WHITE,
+        )
+    }
+
+    #[test]
+    fn draws_across_the_zoom_range() {
+        for total_zoom in [Camera::ZOOM_MIN, 1.0, Camera::ZOOM_MAX] {
+            for angle in [0.0, 0.42, std::f64::consts::FRAC_PI_2] {
+                draw_at(total_zoom, angle)
+                    .unwrap_or_else(|e| panic!("drawing failed at zoom {total_zoom}: {e:?}"));
+            }
+        }
+    }
 }

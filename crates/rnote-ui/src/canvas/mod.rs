@@ -470,23 +470,37 @@ mod imp {
 
             if let Err(e) = || -> anyhow::Result<()> {
                 let clip_bounds = if let Some(parent) = obj.parent() {
+                    let parent_origin = parent
+                        .compute_point(&*obj, &graphene::Point::zero())
+                        .unwrap()
+                        .to_p2d_vec();
                     Aabb::new_positive(
-                        parent
-                            .compute_point(&*obj, &graphene::Point::zero())
-                            .unwrap()
-                            .to_p2d_vec(),
+                        parent_origin,
                         Vector2::new(parent.width() as f64, parent.height() as f64),
                     )
                 } else {
                     obj.bounds()
                 };
+                // Overlays placed on the window rather than on the document (the ruler) need to
+                // know where the canvas sits inside it: in the bounded layouts the canvas is only
+                // as large as the document and is centered, with a margin that changes with zoom.
+                let surface_origin = obj
+                    .parent()
+                    .and_then(|parent| obj.compute_point(&parent, &graphene::Point::zero()))
+                    .map(|p| p.to_p2d_vec())
+                    .unwrap_or(Vector2::ZERO);
+                self.engine
+                    .borrow_mut()
+                    .camera
+                    .set_surface_origin(surface_origin);
+
                 // push the clip
                 snapshot.push_clip(&graphene::Rect::from_p2d_aabb(clip_bounds));
 
                 // Draw the entire engine
                 self.engine
                     .borrow()
-                    .draw_to_gtk_snapshot(snapshot, obj.bounds())?;
+                    .draw_to_gtk_snapshot(snapshot, obj.bounds(), clip_bounds)?;
 
                 // pop the clip
                 snapshot.pop();

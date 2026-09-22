@@ -719,16 +719,8 @@ mod imp {
                             let config = canvas.engine_ref().engine_config().clone();
                             let config = config.read();
                             let ruler = &config.pens_config.brush_config.ruler_config;
-                            if ruler.visible {
-                                let p = Vector2::new(x, y);
-                                let rel = p - ruler.anchor;
-                                let inside_body =
-                                    rel.dot(ruler.normal()).abs() <= ruler.body_half_width;
-                                if inside_body {
-                                    CanvasDragMode::Ruler(ruler.anchor, ruler.dial_pos)
-                                } else {
-                                    CanvasDragMode::Canvas(canvas.engine_ref().camera.offset())
-                                }
+                            if ruler.hit_body_window(Vector2::new(x, y)) {
+                                CanvasDragMode::Ruler(ruler.anchor, ruler.dial_pos)
                             } else {
                                 CanvasDragMode::Canvas(canvas.engine_ref().camera.offset())
                             }

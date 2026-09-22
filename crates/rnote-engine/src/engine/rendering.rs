@@ -158,15 +158,22 @@ impl Engine {
 
     /// Draws the entire engine (doc, pens, strokes, selection, ..) to a GTK snapshot.
     #[cfg(feature = "ui")]
+    /// `surface_bounds` are the bounds of the canvas itself, `visible_bounds` the area that is
+    /// visible on screen, both in surface coordinates. In the bounded layouts the canvas is only as
+    /// large as the document, so the visible area extends past it once the document is zoomed out
+    /// far enough to fit on screen.
     pub fn draw_to_gtk_snapshot(
         &self,
         snapshot: &gtk4::Snapshot,
         surface_bounds: p2d::bounding_volume::Aabb,
+        visible_bounds: p2d::bounding_volume::Aabb,
     ) -> anyhow::Result<()> {
         use crate::drawable::DrawableOnDoc;
         use crate::engine::visual_debug;
         use crate::engine_view;
-        use gtk4::prelude::*;
+        use crate::ext::GrapheneRectExt;
+        use gtk4::{graphene, prelude::*};
+        use rnote_compose::ext::DAffine2Ext;
 
         let doc_bounds = self.document.bounds();
         let viewport = self.camera.viewport();
@@ -192,6 +199,32 @@ impl Engine {
                    self.camera.image_scale(),
                );
         */
+        // The ruler is drawn here instead of with the pens, because the pens are clamped to the
+        // camera viewport, which in the bounded layouts is only as large as the document - the
+        // ruler would be cut off outside the page.
+        {
+            let total_zoom = self.camera.total_zoom();
+            let camera_offset = self.camera.offset();
+            // The zoom is positive, so the corners stay ordered.
+            let visible_doc = Aabb::new(
+                (visible_bounds.mins + camera_offset) / total_zoom,
+                (visible_bounds.maxs + camera_offset) / total_zoom,
+            );
+
+            snapshot.save();
+            let cairo_cx = snapshot.append_cairo(&graphene::Rect::from_p2d_aabb(visible_bounds));
+            let mut piet_cx = piet_cairo::CairoRenderContext::new(&cairo_cx);
+            piet_cx.transform(self.camera.transform().to_kurbo());
+            crate::pens::ruler::draw_ruler_on_doc(
+                &mut piet_cx,
+                &self.config.read().pens_config.brush_config.ruler_config,
+                visible_doc,
+                crate::pens::pensconfig::rulerconfig::RulerView::from_camera(&self.camera),
+                &self.document.config.background.color,
+            )?;
+            snapshot.restore();
+        }
+
         self.penholder
             .draw_on_doc_to_gtk_snapshot(snapshot, &engine_view!(self))?;
 
