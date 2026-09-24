@@ -40,6 +40,15 @@ pub struct Camera {
     #[serde(skip)]
     temporary_zoom: f64,
 
+    /// The origin of the canvas in window coordinates.
+    ///
+    /// In the bounded layouts the canvas is only as large as the document and is centered in the
+    /// window, so the two coordinate systems are offset by a margin that changes with the zoom.
+    /// Overlays that are placed on the window rather than on the document need it to find their
+    /// place on the document.
+    #[serde(skip)]
+    surface_origin: Vector2,
+
     /// The scale factor of the surface, usually 1.0 or 2.0 for high-dpi screens.
     ///
     /// This value could become a non-integer value in the future, so it is stored as float.
@@ -57,6 +66,7 @@ impl Default for Camera {
             size: Vector2::new(800.0, 600.0),
             zoom: 1.0,
             temporary_zoom: 1.0,
+            surface_origin: Vector2::ZERO,
             scale_factor: 1.0,
             zoom_task_handle: None,
         }
@@ -102,6 +112,17 @@ impl Camera {
     /// The current viewport offset in surface coordinate space.
     pub fn offset(&self) -> Vector2 {
         self.offset
+    }
+
+    /// The origin of the canvas in window coordinates.
+    pub fn surface_origin(&self) -> Vector2 {
+        self.surface_origin
+    }
+
+    /// Set the origin of the canvas in window coordinates. Updated by the UI when the canvas is
+    /// laid out, which is also when the zoom changes its size and with it the margin around it.
+    pub fn set_surface_origin(&mut self, surface_origin: Vector2) {
+        self.surface_origin = surface_origin;
     }
 
     pub fn set_offset(&mut self, offset: Vector2, doc: &Document) -> WidgetFlags {
