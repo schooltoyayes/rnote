@@ -120,6 +120,23 @@
                 <class name="medium" />
               </style>
               <child>
+                <object class="AdwSpinRow" id="ruler_angle_row">
+                  <property name="title" translatable="yes">Angle</property>
+                  <property name="subtitle" translatable="yes">Rotate the ruler around the angle dial to an exact angle (°)</property>
+                  <property name="digits">1</property>
+                  <property name="numeric">true</property>
+                  <property name="adjustment">
+                    <object class="GtkAdjustment">
+                      <property name="lower">-90</property>
+                      <property name="upper">90</property>
+                      <property name="step-increment">1</property>
+                      <property name="page-increment">15</property>
+                      <property name="value">0</property>
+                    </object>
+                  </property>
+                </object>
+              </child>
+              <child>
                 <object class="AdwSwitchRow" id="ruler_angle_snap_row">
                   <property name="title" translatable="yes">Snap to Common Angles</property>
                   <property name="subtitle" translatable="yes">When rotating with two fingers, snap to 0°, ±45° and ±90°. Scroll rotation is never snapped.</property>

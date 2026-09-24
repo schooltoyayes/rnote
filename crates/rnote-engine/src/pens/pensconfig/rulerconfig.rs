@@ -276,6 +276,29 @@ impl RulerConfig {
         -(((angle_rad + half_pi).rem_euclid(pi)) - half_pi)
     }
 
+    /// The angle as it is displayed in the dial, in degrees, see [`Self::normalize_angle`].
+    pub fn displayed_angle_deg(&self) -> f64 {
+        Self::normalize_angle(self.angle).to_degrees()
+    }
+
+    /// Rotate the ruler around the dial so that it displays `angle_deg`.
+    ///
+    /// The dial stays where it is, so the ruler turns in place. Of the two stored angles that
+    /// describe the same line, the one closer to the current angle is picked so the tick pattern
+    /// does not flip around.
+    pub fn set_displayed_angle_deg(&mut self, angle_deg: f64) {
+        let pi = std::f64::consts::PI;
+        let base = -angle_deg.to_radians();
+        let new_angle = base + ((self.angle - base) / pi).round() * pi;
+        let delta = new_angle - self.angle;
+
+        let v = self.anchor - self.dial_pos;
+        let (sin_a, cos_a) = delta.sin_cos();
+        self.anchor =
+            self.dial_pos + Vector2::new(v.x * cos_a - v.y * sin_a, v.x * sin_a + v.y * cos_a);
+        self.angle = new_angle;
+    }
+
     /// Whether `angle_rad` is essentially equal to one of the snap targets
     /// (0°, ±45°, ±90° — modulo π for line symmetry). Used by the
     /// hysteretic snap to know whether to use the "enter" or "leave" window.
@@ -412,6 +435,29 @@ mod tests {
         // Keeps its position along the ruler, and sits exactly one half width off the centerline.
         assert!((projected.x - pos_window.x).abs() < 1e-9);
         assert!((ruler.perp_distance(projected) - ruler.body_half_width).abs() < 1e-9);
+    }
+
+    #[test]
+    fn set_displayed_angle_turns_the_ruler_around_the_dial() {
+        let mut ruler = horizontal_ruler();
+        ruler.anchor = Vector2::new(100.0, 150.0);
+        ruler.dial_pos = Vector2::new(200.0, 150.0);
+
+        for angle_deg in [37.5, -12.0, 90.0, -89.9, 0.0] {
+            ruler.set_displayed_angle_deg(angle_deg);
+
+            assert!(
+                (ruler.displayed_angle_deg() - angle_deg).abs() < 1e-9
+                    || (angle_deg.abs() - 90.0).abs() < 1e-9,
+                "set {angle_deg}, got {}",
+                ruler.displayed_angle_deg()
+            );
+            // The dial stays on the centerline, and the anchor keeps its distance to it.
+            assert!(ruler.perp_distance(ruler.dial_pos).abs() < 1e-9);
+            assert!(((ruler.anchor - ruler.dial_pos).length() - 100.0).abs() < 1e-9);
+        }
+        // Back at 0° the ruler is horizontal again with the same tick orientation.
+        assert!((ruler.direction() - Vector2::new(1.0, 0.0)).length() < 1e-9);
     }
 
     #[test]

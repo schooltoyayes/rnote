@@ -11,6 +11,7 @@ use rnote_compose::style::PressureCurve;
 use rnote_compose::style::textured::{TexturedDotsDistribution, TexturedOptions};
 use rnote_engine::pens::pensconfig::BrushConfig;
 use rnote_engine::pens::pensconfig::brushconfig::{BrushStyle, SolidOptions};
+use std::cell::Cell;
 
 mod imp {
     use super::*;
@@ -62,6 +63,10 @@ mod imp {
         pub(crate) ruler_popover: TemplateChild<Popover>,
         #[template_child]
         pub(crate) ruler_popover_close_button: TemplateChild<Button>,
+        #[template_child]
+        pub(crate) ruler_angle_row: TemplateChild<adw::SpinRow>,
+        /// Set while the angle row gets synced to the ruler, so the sync does not rotate it.
+        pub(crate) ruler_angle_syncing: Cell<bool>,
         #[template_child]
         pub(crate) ruler_snap_distance_row: TemplateChild<adw::SpinRow>,
         #[template_child]
@@ -490,6 +495,46 @@ impl RnBrushPage {
             }
         ));
 
+        // The ruler may have been turned with gestures since, show its current angle.
+        imp.ruler_popover.connect_show(clone!(
+            #[weak(rename_to=brushpage)]
+            self,
+            #[weak]
+            appwindow,
+            move |_| {
+                let angle_deg = appwindow
+                    .engine_config()
+                    .read()
+                    .pens_config
+                    .brush_config
+                    .ruler_config
+                    .displayed_angle_deg();
+                brushpage.sync_ruler_angle_row(angle_deg);
+            }
+        ));
+
+        imp.ruler_angle_row.get().connect_changed(clone!(
+            #[weak(rename_to=brushpage)]
+            self,
+            #[weak]
+            appwindow,
+            move |row| {
+                if brushpage.imp().ruler_angle_syncing.get() {
+                    return;
+                }
+                appwindow
+                    .engine_config()
+                    .write()
+                    .pens_config
+                    .brush_config
+                    .ruler_config
+                    .set_displayed_angle_deg(row.value());
+                if let Some(canvas) = appwindow.active_tab_canvas() {
+                    canvas.queue_draw();
+                }
+            }
+        ));
+
         imp.ruler_snap_distance_row.get().connect_changed(clone!(
             #[weak]
             appwindow,
@@ -650,5 +695,13 @@ impl RnBrushPage {
             .set_value(brush_config.ruler_config.body_opacity);
         imp.ruler_scroll_step_row
             .set_value(brush_config.ruler_config.scroll_rotation_step_deg);
+        self.sync_ruler_angle_row(brush_config.ruler_config.displayed_angle_deg());
+    }
+
+    fn sync_ruler_angle_row(&self, angle_deg: f64) {
+        let imp = self.imp();
+        imp.ruler_angle_syncing.set(true);
+        imp.ruler_angle_row.set_value(angle_deg);
+        imp.ruler_angle_syncing.set(false);
     }
 }
