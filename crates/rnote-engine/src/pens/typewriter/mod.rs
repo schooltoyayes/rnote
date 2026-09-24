@@ -458,9 +458,8 @@ impl PenBehaviour for Typewriter {
                                 selection_cursor.cur_cursor(),
                             );
                             // Current selection as clipboard text
-                            let selection_text = textstroke
-                                .get_text_slice_for_range(selection_range)
-                                .to_string();
+                            let selection_text =
+                                textstroke.text_without_soft_breaks(selection_range);
                             clipboard_content.push((
                                 selection_text.into_bytes(),
                                 String::from("text/plain;charset=utf-8"),
@@ -510,9 +509,8 @@ impl PenBehaviour for Typewriter {
                             );
 
                             // Current selection as clipboard text
-                            let selection_text = textstroke
-                                .get_text_slice_for_range(selection_range)
-                                .to_string();
+                            let selection_text =
+                                textstroke.text_without_soft_breaks(selection_range);
 
                             textstroke.replace_text_between_selection_cursors(
                                 cursor,
@@ -554,6 +552,7 @@ impl PenBehaviour for Typewriter {
             }
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
         self.reset_blink();
 
         if sender.send(Ok((clipboard_content, widget_flags))).is_err() {
@@ -805,6 +804,7 @@ impl Typewriter {
             },
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
         self.reset_blink();
         widget_flags.redraw = true;
 
@@ -839,6 +839,8 @@ impl Typewriter {
             widget_flags.store_modified = true;
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
+
         widget_flags
     }
 
@@ -866,6 +868,8 @@ impl Typewriter {
             widget_flags.store_modified = true;
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
+
         widget_flags
     }
 
@@ -891,6 +895,8 @@ impl Typewriter {
             widget_flags.redraw = true;
             widget_flags.store_modified = true;
         }
+
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
 
         widget_flags
     }
@@ -925,6 +931,8 @@ impl Typewriter {
             widget_flags.store_modified = true;
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
+
         widget_flags
     }
 
@@ -952,6 +960,64 @@ impl Typewriter {
             widget_flags.store_modified = true;
         }
 
+        widget_flags |= self.update_lists_after_event(None, true, engine_view);
+
+        widget_flags
+    }
+
+    /// Keep the lists in the text stroke that is being modified up to date, and move the cursor
+    /// out of list markers and automatic indentations.
+    ///
+    /// `typed` is the text that was just typed, `forward` the direction the cursor was moving in.
+    /// See [TextStroke::update_lists].
+    pub(super) fn update_lists_after_event(
+        &mut self,
+        typed: Option<&str>,
+        forward: bool,
+        engine_view: &mut EngineViewMut,
+    ) -> WidgetFlags {
+        let mut widget_flags = WidgetFlags::default();
+
+        let TypewriterState::Modifying {
+            modify_state,
+            stroke_key,
+            cursor,
+            ..
+        } = &mut self.state
+        else {
+            return widget_flags;
+        };
+        let Some(Stroke::TextStroke(textstroke)) = engine_view.store.get_stroke_mut(*stroke_key)
+        else {
+            return widget_flags;
+        };
+        let selection_cursor = match modify_state {
+            ModifyState::Selecting {
+                selection_cursor, ..
+            } => Some(selection_cursor),
+            _ => None,
+        };
+
+        let changed = textstroke.update_lists(cursor, selection_cursor, typed);
+        textstroke.normalize_cursor(cursor, forward);
+
+        if changed {
+            engine_view.store.update_geometry_for_stroke(*stroke_key);
+            engine_view.store.regenerate_rendering_for_stroke(
+                *stroke_key,
+                engine_view.camera.viewport(),
+                engine_view.camera.image_scale(),
+            );
+            widget_flags |= engine_view
+                .document
+                .resize_autoexpand(engine_view.store, engine_view.camera);
+            widget_flags |= engine_view
+                .store
+                .update_latest_history_entry(Instant::now());
+            widget_flags.store_modified = true;
+            widget_flags.redraw = true;
+        }
+
         widget_flags
     }
 
@@ -973,5 +1039,103 @@ fn play_sound(
 ) {
     if let Some(audioplayer) = audioplayer {
         audioplayer.play_typewriter_key_sound(keyboard_key);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Engine;
+    use crate::pens::PenStyle;
+    use crate::strokes::Stroke;
+    use p2d::math::Vector2;
+    use rnote_compose::penevent::{KeyboardKey, ModifierKey, PenEvent};
+    use rnote_compose::penpath::Element;
+    use std::collections::HashSet;
+    use std::time::Instant;
+
+    fn text(engine: &Engine) -> String {
+        let key = *engine.store.keys_sorted_chrono().last().unwrap();
+        match engine.store.get_stroke_ref(key) {
+            Some(Stroke::TextStroke(textstroke)) => textstroke.text.clone(),
+            _ => panic!("no text stroke"),
+        }
+    }
+
+    fn press(engine: &mut Engine, keyboard_key: KeyboardKey, modifier_keys: &[ModifierKey]) {
+        let _ = engine.handle_pen_event(
+            PenEvent::KeyPressed {
+                keyboard_key,
+                modifier_keys: modifier_keys.iter().copied().collect(),
+            },
+            None,
+            Instant::now(),
+        );
+    }
+
+    fn type_text(engine: &mut Engine, text: &str) {
+        for c in text.chars() {
+            let _ = engine.handle_pen_event(
+                PenEvent::Text {
+                    text: c.to_string(),
+                },
+                None,
+                Instant::now(),
+            );
+        }
+    }
+
+    #[test]
+    fn typing_lists() {
+        let mut engine = Engine::default();
+        let _ = engine.change_pen_style(PenStyle::Typewriter);
+        let element = Element::new(Vector2::new(100.0, 100.0), 1.0);
+        let _ = engine.handle_pen_event(
+            PenEvent::Down {
+                element,
+                modifier_keys: HashSet::new(),
+            },
+            None,
+            Instant::now(),
+        );
+        let _ = engine.handle_pen_event(
+            PenEvent::Up {
+                element,
+                modifier_keys: HashSet::new(),
+            },
+            None,
+            Instant::now(),
+        );
+
+        type_text(&mut engine, "- first");
+        assert_eq!(text(&engine), "• first");
+
+        press(&mut engine, KeyboardKey::CarriageReturn, &[]);
+        type_text(&mut engine, "second");
+        press(&mut engine, KeyboardKey::HorizontalTab, &[]);
+        assert_eq!(text(&engine), "• first\n\t◦ second");
+
+        press(
+            &mut engine,
+            KeyboardKey::HorizontalTab,
+            &[ModifierKey::KeyboardShift],
+        );
+        assert_eq!(text(&engine), "• first\n• second");
+
+        // Enter on the empty item ends the list.
+        press(&mut engine, KeyboardKey::CarriageReturn, &[]);
+        press(&mut engine, KeyboardKey::CarriageReturn, &[]);
+        type_text(&mut engine, "1. a");
+        press(&mut engine, KeyboardKey::CarriageReturn, &[]);
+        type_text(&mut engine, "b");
+        assert_eq!(text(&engine), "• first\n• second\n1. a\n2. b");
+
+        // Home goes to the start of the item's text, where backspace removes the marker.
+        press(&mut engine, KeyboardKey::Home, &[]);
+        press(&mut engine, KeyboardKey::BackSpace, &[]);
+        assert_eq!(text(&engine), "• first\n• second\n1. a\nb");
+
+        // Typing continues where the marker was.
+        type_text(&mut engine, "x");
+        assert_eq!(text(&engine), "• first\n• second\n1. a\nxb");
     }
 }

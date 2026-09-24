@@ -1,3 +1,9 @@
+// Modules
+mod lists;
+
+// Re-exports
+pub use lists::SOFT_BREAK;
+
 // Imports
 use super::Content;
 use crate::{Camera, Drawable};
@@ -16,7 +22,7 @@ use std::ops::Range;
 use tracing::error;
 use unicode_segmentation::{GraphemeCursor, UnicodeSegmentation};
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "font_style")]
 pub enum FontStyle {
     #[serde(rename = "regular")]
@@ -84,7 +90,7 @@ impl From<TextAlignment> for piet::TextAlignment {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename = "text_attribute")]
 pub enum TextAttribute {
     /// The font family.
@@ -560,15 +566,27 @@ impl TextStroke {
             .text_style
             .build_text_layout(&mut piet_cairo::CairoText::new(), self.text.clone())
             .map_err(|e| anyhow::anyhow!("Building text layout failed, Err: {e:?}"))?;
-        let hit_test_point = text_layout.hit_test_point(
-            self.affine
-                .inverse()
-                .transform_point2(coord)
-                .to_kurbo_point(),
-        );
+        let local_coord = self
+            .affine
+            .inverse()
+            .transform_point2(coord)
+            .to_kurbo_point();
+        let mut idx = text_layout.hit_test_point(local_coord).idx;
+
+        // A hit behind the end of a line that ends in an automatic line break lands after the
+        // break, move it back to the end of the line.
+        if let Some(line_metric) = (0..text_layout.line_count())
+            .filter_map(|line| text_layout.line_metric(line))
+            .find(|lm| lm.y_offset + lm.height >= local_coord.y)
+        {
+            let line_text = &self.text[line_metric.start_offset..line_metric.end_offset];
+            if line_text.ends_with(SOFT_BREAK) {
+                idx = idx.min(line_metric.end_offset - SOFT_BREAK.len_utf8());
+            }
+        }
 
         Ok(GraphemeCursor::new(
-            hit_test_point.idx,
+            self.normalized_cursor_pos(idx, true),
             self.text.len(),
             true,
         ))
@@ -940,17 +958,11 @@ impl TextStroke {
             let line_metric = &lines[hittest_position.line];
             let mut offset = line_metric.end_offset;
 
-            // Move cursor in front of new line characters if they exist.
-            if offset > line_metric.start_offset
-                && (self.text.chars().nth(offset - 1) == Some('\n'))
-            {
-                offset -= 1;
-            }
-
-            if offset > line_metric.start_offset
-                && (self.text.chars().nth(offset - 1) == Some('\r'))
-            {
-                offset -= 1;
+            // Move cursor in front of line break characters if they exist.
+            for line_break in ['\n', '\r', SOFT_BREAK] {
+                if offset > line_metric.start_offset && self.text[..offset].ends_with(line_break) {
+                    offset -= line_break.len_utf8();
+                }
             }
 
             cursor.set_cursor(offset);

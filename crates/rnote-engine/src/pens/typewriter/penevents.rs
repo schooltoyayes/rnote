@@ -348,6 +348,7 @@ impl Typewriter {
                                 .typewriter_config
                                 .set_text_width(new_text_width);
                             textstroke.text_style.set_max_width(Some(new_text_width));
+                            textstroke.update_lists(cursor, None, None);
                             engine_view.store.regenerate_rendering_for_stroke(
                                 *stroke_key,
                                 engine_view.camera.viewport(),
@@ -521,6 +522,13 @@ impl Typewriter {
     ) -> (EventResult<PenProgress>, WidgetFlags) {
         let mut widget_flags = WidgetFlags::default();
         self.pos = None;
+
+        if let Some((event_result, list_widget_flags)) =
+            self.handle_list_key(keyboard_key, &modifier_keys, engine_view)
+        {
+            self.reset_blink();
+            return (event_result, list_widget_flags);
+        }
 
         let text_width = engine_view
             .config
@@ -1100,9 +1108,110 @@ impl Typewriter {
             }
         };
 
+        let typed = match keyboard_key {
+            KeyboardKey::Unicode(keychar)
+                if !modifier_keys.contains(&ModifierKey::KeyboardCtrl) =>
+            {
+                Some(keychar.to_string())
+            }
+            _ => None,
+        };
+        let forward = !matches!(keyboard_key, KeyboardKey::NavLeft | KeyboardKey::BackSpace);
+        widget_flags |= self.update_lists_after_event(typed.as_deref(), forward, engine_view);
         self.reset_blink();
 
         (event_result, widget_flags)
+    }
+
+    /// Handle the keys that behave differently in list items.
+    ///
+    /// Returns `None` when the key is handled as usual.
+    fn handle_list_key(
+        &mut self,
+        keyboard_key: KeyboardKey,
+        modifier_keys: &HashSet<ModifierKey>,
+        engine_view: &mut EngineViewMut,
+    ) -> Option<(EventResult<PenProgress>, WidgetFlags)> {
+        let TypewriterState::Modifying {
+            modify_state,
+            stroke_key,
+            cursor,
+            pen_down,
+        } = &mut self.state
+        else {
+            return None;
+        };
+        let Some(Stroke::TextStroke(textstroke)) = engine_view.store.get_stroke_mut(*stroke_key)
+        else {
+            return None;
+        };
+        let ctrl = modifier_keys.contains(&ModifierKey::KeyboardCtrl);
+        let shift = modifier_keys.contains(&ModifierKey::KeyboardShift);
+        let mut quit_selecting = false;
+
+        let handled = match modify_state {
+            ModifyState::Idle => match keyboard_key {
+                KeyboardKey::CarriageReturn | KeyboardKey::Linefeed if !ctrl && !shift => {
+                    textstroke.list_newline(cursor)
+                }
+                KeyboardKey::HorizontalTab if !ctrl => {
+                    textstroke.list_change_level(cursor, None, shift)
+                }
+                KeyboardKey::BackSpace if !ctrl => textstroke.list_backspace(cursor),
+                KeyboardKey::Delete if !ctrl => textstroke.list_delete(cursor),
+                _ => false,
+            },
+            ModifyState::Selecting {
+                selection_cursor, ..
+            } => match keyboard_key {
+                KeyboardKey::HorizontalTab if !ctrl => {
+                    textstroke.list_change_level(cursor, Some(selection_cursor), shift)
+                }
+                KeyboardKey::CarriageReturn | KeyboardKey::Linefeed if !ctrl && !shift => {
+                    textstroke.replace_text_between_selection_cursors(cursor, selection_cursor, "");
+                    if !textstroke.list_newline(cursor) {
+                        textstroke.insert_text_after_cursor("\n", cursor);
+                        textstroke.update_lists(cursor, None, None);
+                    }
+                    quit_selecting = true;
+                    true
+                }
+                _ => false,
+            },
+            _ => false,
+        };
+        if !handled {
+            return None;
+        }
+
+        #[cfg(feature = "ui")]
+        super::play_sound(Some(keyboard_key), engine_view.audioplayer);
+
+        let mut widget_flags = WidgetFlags::default();
+        *pen_down = false;
+        if quit_selecting {
+            *modify_state = ModifyState::Idle;
+        }
+        engine_view.store.update_geometry_for_stroke(*stroke_key);
+        engine_view.store.regenerate_rendering_for_stroke(
+            *stroke_key,
+            engine_view.camera.viewport(),
+            engine_view.camera.image_scale(),
+        );
+        widget_flags |= engine_view
+            .document
+            .resize_autoexpand(engine_view.store, engine_view.camera);
+        widget_flags |= engine_view.store.record(Instant::now());
+        widget_flags.store_modified = true;
+
+        Some((
+            EventResult {
+                handled: true,
+                propagate: EventPropagation::Stop,
+                progress: PenProgress::InProgress,
+            },
+            widget_flags,
+        ))
     }
 
     pub(super) fn handle_pen_event_text(
@@ -1112,6 +1221,7 @@ impl Typewriter {
         engine_view: &mut EngineViewMut,
     ) -> (EventResult<PenProgress>, WidgetFlags) {
         let mut widget_flags = WidgetFlags::default();
+        let typed = text.clone();
         let text_width = engine_view
             .config
             .pens_config
@@ -1269,6 +1379,8 @@ impl Typewriter {
                 }
             }
         };
+
+        widget_flags |= self.update_lists_after_event(Some(&typed), true, engine_view);
 
         (event_result, widget_flags)
     }

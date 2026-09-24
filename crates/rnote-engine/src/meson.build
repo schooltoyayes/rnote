@@ -71,6 +71,7 @@ rnote_engine_sources = files(
     'strokes/shapestroke.rs',
     'strokes/stroke.rs',
     'strokes/textstroke.rs',
+    'strokes/textstroke/lists.rs',
     'strokes/vectorimage.rs',
     'svg.rs',
     'tasks.rs',
