@@ -66,6 +66,24 @@
           </object>
         </child>
         <child>
+          <object class="GtkToggleButton" id="set_square_toggle">
+            <property name="tooltip_text" translatable="yes">Toggle Set Square</property>
+            <property name="icon-name">pen-tools-set-square-symbolic</property>
+            <style>
+              <class name="flat" />
+            </style>
+          </object>
+        </child>
+        <child>
+          <object class="GtkToggleButton" id="protractor_toggle">
+            <property name="tooltip_text" translatable="yes">Toggle Protractor</property>
+            <property name="icon-name">pen-tools-protractor-symbolic</property>
+            <style>
+              <class name="flat" />
+            </style>
+          </object>
+        </child>
+        <child>
           <object class="GtkMenuButton" id="ruler_menubutton">
             <property name="icon-name">settings-symbolic</property>
             <property name="direction">left</property>
@@ -132,6 +150,21 @@
                       <property name="step-increment">1</property>
                       <property name="page-increment">15</property>
                       <property name="value">0</property>
+                    </object>
+                  </property>
+                </object>
+              </child>
+              <child>
+                <object class="AdwSpinRow" id="ruler_tool_size_row">
+                  <property name="title" translatable="yes">Set Square and Protractor Size</property>
+                  <property name="subtitle" translatable="yes">Length of the long edge of the set square and the diameter of the protractor on screen (px)</property>
+                  <property name="adjustment">
+                    <object class="GtkAdjustment">
+                      <property name="lower">200</property>
+                      <property name="upper">1000</property>
+                      <property name="step-increment">20</property>
+                      <property name="page-increment">100</property>
+                      <property name="value">440</property>
                     </object>
                   </property>
                 </object>

@@ -11,6 +11,7 @@ use p2d::math::Vector2;
 use rnote_compose::penevent::ShortcutKey;
 use rnote_engine::Camera;
 use rnote_engine::ext::GraphenePointExt;
+use rnote_engine::pens::pensconfig::rulerconfig::RulerKind;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::Instant;
@@ -114,7 +115,22 @@ fn rotate_ruler_with_scroll(
         let revivable_session = session_on_line
             .filter(|s| now.duration_since(s.last_event_time) < RULER_SCROLL_REVIVAL_TIMEOUT);
 
-        let pivot = if let Some(session) = prev_session {
+        let pivot = if ruler.kind != RulerKind::Ruler {
+            // The set square and the protractor turn around the middle of their long edge,
+            // when the pointer is on them or they are being turned already.
+            let turning = prev_session_raw.is_some_and(|s| {
+                now.duration_since(s.last_event_time) < RULER_SCROLL_SESSION_TIMEOUT
+            });
+            let on_body = imp
+                .pointer_pos
+                .get()
+                .is_some_and(|p| ruler.hit_body_window(p));
+            if !turning && !on_body {
+                return false;
+            }
+            ruler.dial_pos = ruler.anchor;
+            ruler.anchor
+        } else if let Some(session) = prev_session {
             // Within the short active-session timeout — definitely reuse.
             session.pivot
         } else if let Some(session) = revivable_session {
@@ -128,10 +144,10 @@ fn rotate_ruler_with_scroll(
             if pointer_far {
                 // User deliberately moved the pointer to a new spot.
                 let p = pointer.unwrap();
-                let rel = p - ruler.anchor;
-                if rel.dot(ruler.normal()).abs() > ruler.body_half_width {
+                if !ruler.hit_body_window(p) {
                     return false;
                 }
+                let rel = p - ruler.anchor;
                 let along = rel.dot(ruler.direction());
                 let projected = ruler.anchor + along * ruler.direction();
                 ruler.dial_pos = projected;
@@ -159,10 +175,10 @@ fn rotate_ruler_with_scroll(
                 ruler.dial_pos
             } else {
                 // Need a fresh pivot at the cursor position. Hit-test the body.
-                let rel = pointer - ruler.anchor;
-                if rel.dot(ruler.normal()).abs() > ruler.body_half_width {
+                if !ruler.hit_body_window(pointer) {
                     return false;
                 }
+                let rel = pointer - ruler.anchor;
                 let along = rel.dot(ruler.direction());
                 let projected = ruler.anchor + along * ruler.direction();
                 ruler.dial_pos = projected;
@@ -700,6 +716,8 @@ mod imp {
                     Canvas(Vector2),
                     /// (anchor_begin, dial_pos_begin) — both translated together.
                     Ruler(Vector2, Vector2),
+                    /// (arm, start position) — turning an arm of the protractor.
+                    ProtractorArm(usize, Vector2),
                 }
                 let drag_mode: Rc<Cell<Option<CanvasDragMode>>> = Rc::new(Cell::new(None));
 
@@ -730,7 +748,10 @@ mod imp {
                             let config = canvas.engine_ref().engine_config().clone();
                             let config = config.read();
                             let ruler = &config.pens_config.brush_config.ruler_config;
-                            if ruler.hit_body_window(Vector2::new(x, y)) {
+                            let pos = Vector2::new(x, y);
+                            if let Some(arm) = ruler.hit_protractor_handle_window(pos) {
+                                CanvasDragMode::ProtractorArm(arm, pos)
+                            } else if ruler.hit_body_window(pos) {
                                 CanvasDragMode::Ruler(ruler.anchor, ruler.dial_pos)
                             } else {
                                 CanvasDragMode::Canvas(canvas.engine_ref().camera.offset())
@@ -741,7 +762,7 @@ mod imp {
                         // the sequence once the finger crosses its drag threshold and
                         // the ruler stops following. Canvas pans intentionally leave
                         // it alone so normal touch scrolling still works.
-                        if matches!(mode, CanvasDragMode::Ruler(..)) {
+                        if !matches!(mode, CanvasDragMode::Canvas(..)) {
                             canvaswrapper.imp().workaround_disable_kinetic_scrolling();
                         }
                         drag_mode.set(Some(mode));
@@ -767,6 +788,17 @@ mod imp {
                                 }
                                 canvas.queue_draw();
                             }
+                            Some(CanvasDragMode::ProtractorArm(arm, start)) => {
+                                canvas
+                                    .engine_ref()
+                                    .engine_config()
+                                    .write()
+                                    .pens_config
+                                    .brush_config
+                                    .ruler_config
+                                    .set_protractor_arm_towards(arm, start + Vector2::new(x, y));
+                                canvas.queue_draw();
+                            }
                             Some(CanvasDragMode::Canvas(offset_begin)) => {
                                 let new_offset = offset_begin - Vector2::new(x, y);
                                 let widget_flags =
@@ -783,7 +815,10 @@ mod imp {
                     #[weak(rename_to=canvaswrapper)]
                     obj,
                     move |_, _, _| {
-                        let was_ruler = matches!(drag_mode.get(), Some(CanvasDragMode::Ruler(..)));
+                        let was_ruler = matches!(
+                            drag_mode.get(),
+                            Some(CanvasDragMode::Ruler(..) | CanvasDragMode::ProtractorArm(..))
+                        );
                         drag_mode.set(None);
                         if was_ruler {
                             canvaswrapper.imp().workaround_restore_kinetic_scrolling();
@@ -950,30 +985,30 @@ mod imp {
                                     // (neither touching it) would still pass the
                                     // hit-test because their centroid lands on the
                                     // centerline.
-                                    let normal = ruler.normal();
-                                    let half_w = ruler.body_half_width;
                                     let seqs = gesture.sequences();
                                     let all_on_body = !seqs.is_empty()
                                         && seqs.iter().all(|seq| {
-                                            gesture
-                                                .point(Some(seq))
-                                                .map(|(x, y)| {
-                                                    let rel = Vector2::new(x, y) - ruler.anchor;
-                                                    rel.dot(normal).abs() <= half_w
-                                                })
-                                                .unwrap_or(false)
+                                            gesture.point(Some(seq)).is_some_and(|(x, y)| {
+                                                ruler.hit_body_window(Vector2::new(x, y))
+                                            })
                                         });
                                     tracing::debug!(
                                         all_on_body,
                                         anchor = ?ruler.anchor,
-                                        half_w,
+                                        kind = ?ruler.kind,
                                         "Two finger gesture on the ruler"
                                     );
                                     if all_on_body {
-                                        // Project centroid onto the ruler centerline.
-                                        let rel = bbcenter - ruler.anchor;
-                                        let along = rel.dot(ruler.direction());
-                                        let projected = ruler.anchor + along * ruler.direction();
+                                        // The ruler turns around the centroid projected onto
+                                        // its centerline, the set square and the protractor
+                                        // around the middle of their long edge.
+                                        let projected = if ruler.kind == RulerKind::Ruler {
+                                            let rel = bbcenter - ruler.anchor;
+                                            let along = rel.dot(ruler.direction());
+                                            ruler.anchor + along * ruler.direction()
+                                        } else {
+                                            ruler.anchor
+                                        };
                                         Some((projected, ruler.anchor, ruler.angle))
                                     } else {
                                         None

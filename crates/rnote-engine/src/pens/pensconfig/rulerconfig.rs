@@ -92,6 +92,67 @@ pub struct RulerConfig {
     /// The stroke that is currently drawn along the ruler, to show its length. In-session only.
     #[serde(skip)]
     pub measurement: Option<RulerMeasurement>,
+    /// Which kind of ruler is shown. Persisted.
+    pub kind: RulerKind,
+    /// Size of the set square and the protractor in surface pixels: half the long edge of the
+    /// set square, the radius of the protractor. Persisted.
+    pub tool_size: f64,
+    /// Angles of the two protractor arms in degrees, from the base line towards the arc.
+    /// In-session only.
+    #[serde(skip)]
+    pub protractor_arms: [f64; 2],
+}
+
+/// The kinds of rulers.
+///
+/// All of them are placed with `anchor` and `angle`: the ruler's centerline, the long edge of the
+/// set square and the base line of the protractor run along `direction()` through the anchor.
+/// The set square and the protractor lie on the side opposite to `normal()`, with the anchor in
+/// the middle of their long edge.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename = "ruler_kind")]
+pub enum RulerKind {
+    /// A straight edge spanning the viewport.
+    #[default]
+    #[serde(rename = "ruler")]
+    Ruler,
+    /// A right isosceles triangle with a centimeter scale on its long edge and a degree scale
+    /// around its middle, like a "Geodreieck".
+    #[serde(rename = "set_square")]
+    SetSquare,
+    /// A half circle with a degree scale and two arms to measure angles.
+    #[serde(rename = "protractor")]
+    Protractor,
+}
+
+/// An edge of the ruler that strokes snap to, in window coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SnapTarget {
+    /// A straight edge through `point` along the unit vector `dir`. `outward` points away from
+    /// the ruler body.
+    Line {
+        point: Vector2,
+        dir: Vector2,
+        outward: Vector2,
+    },
+    /// The arc of the protractor.
+    Arc { center: Vector2, radius: f64 },
+}
+
+impl SnapTarget {
+    /// The closest point on the target.
+    pub fn project(&self, pos: Vector2) -> Vector2 {
+        match *self {
+            SnapTarget::Line { point, dir, .. } => point + (pos - point).dot(dir) * dir,
+            SnapTarget::Arc { center, radius } => {
+                center + (pos - center).try_normalize().unwrap_or(Vector2::X) * radius
+            }
+        }
+    }
+
+    fn distance(&self, pos: Vector2) -> f64 {
+        (self.project(pos) - pos).length()
+    }
 }
 
 /// A stroke drawn along the ruler, in document coordinates.
@@ -99,8 +160,20 @@ pub struct RulerConfig {
 pub struct RulerMeasurement {
     pub start: Vector2,
     pub end: Vector2,
-    /// The edge the stroke is drawn along, see [`RulerConfig::snap_side`].
-    pub side: f64,
+    /// The edge the stroke is drawn along, in window coordinates.
+    pub target: SnapTarget,
+}
+
+/// A place where strokes can snap to the ruler.
+struct SnapCandidate {
+    target: SnapTarget,
+    /// Along the target, the range where it can be snapped to: for lines the distance from the
+    /// target's point along its direction, for arcs the distance from the base line towards the
+    /// arc. `None` if it is unlimited.
+    range: Option<(f64, f64)>,
+    /// Whether the target can be snapped to from inside the ruler body. Otherwise the body is
+    /// dragged there.
+    inside_body: bool,
 }
 
 impl Default for RulerConfig {
@@ -119,6 +192,9 @@ impl Default for RulerConfig {
             scroll_rotation_step_deg: Self::SCROLL_ROTATION_STEP_DEG_DEFAULT,
             metric_scale: true,
             measurement: None,
+            kind: RulerKind::default(),
+            tool_size: Self::TOOL_SIZE_DEFAULT,
+            protractor_arms: Self::PROTRACTOR_ARMS_DEFAULT,
         }
     }
 }
@@ -143,6 +219,17 @@ impl RulerConfig {
     pub const SCROLL_ROTATION_STEP_DEG_DEFAULT: f64 = 2.0;
     pub const SCROLL_ROTATION_STEP_DEG_MIN: f64 = 0.1;
     pub const SCROLL_ROTATION_STEP_DEG_MAX: f64 = 15.0;
+    /// Default / range for `tool_size`, in surface pixels.
+    pub const TOOL_SIZE_DEFAULT: f64 = 220.0;
+    pub const TOOL_SIZE_MIN: f64 = 100.0;
+    pub const TOOL_SIZE_MAX: f64 = 500.0;
+    pub const PROTRACTOR_ARMS_DEFAULT: [f64; 2] = [0.0, 60.0];
+    /// How far the protractor arms reach past the arc, in surface pixels.
+    pub const PROTRACTOR_ARM_EXTENSION_PX: f64 = 48.0;
+    /// Distance of the arm handles from the arc, in surface pixels.
+    pub const PROTRACTOR_HANDLE_OFFSET_PX: f64 = 30.0;
+    /// Radius of the arm handles, in surface pixels.
+    pub const PROTRACTOR_HANDLE_RADIUS_PX: f64 = 12.0;
     /// Length of major tick marks in surface pixels.
     pub const TICK_MAJOR_LEN_PX: f64 = 14.0;
     /// Length of minor tick marks in surface pixels.
@@ -253,43 +340,208 @@ impl RulerConfig {
         (window_pos - self.anchor).dot(self.normal())
     }
 
-    /// Whether `window_pos` (in window coordinates) lies within the ruler body strip.
+    /// Unit vector from the long edge of the set square and the base line of the protractor
+    /// towards their body.
+    fn up(&self) -> Vector2 {
+        -self.normal()
+    }
+
+    /// The corners of the set square in window coordinates: the ends of the long edge, then the
+    /// right angle.
+    pub fn set_square_corners(&self) -> [Vector2; 3] {
+        let (dir, up, size) = (self.direction(), self.up(), self.tool_size);
+        [
+            self.anchor - size * dir,
+            self.anchor + size * dir,
+            self.anchor + size * up,
+        ]
+    }
+
+    /// Unit vector along the protractor arm with the given angle in degrees.
+    pub fn protractor_arm_direction(&self, arm_deg: f64) -> Vector2 {
+        let arm = arm_deg.to_radians();
+        arm.cos() * self.direction() + arm.sin() * self.up()
+    }
+
+    /// Where the handle of a protractor arm is, in window coordinates.
+    pub fn protractor_handle_pos(&self, arm: usize) -> Vector2 {
+        self.anchor
+            + (self.tool_size + Self::PROTRACTOR_HANDLE_OFFSET_PX)
+                * self.protractor_arm_direction(self.protractor_arms[arm])
+    }
+
+    /// The protractor arm whose handle is at `window_pos`, if any.
+    pub fn hit_protractor_handle_window(&self, window_pos: Vector2) -> Option<usize> {
+        if !self.visible || self.kind != RulerKind::Protractor {
+            return None;
+        }
+        (0..self.protractor_arms.len())
+            .map(|arm| (arm, (self.protractor_handle_pos(arm) - window_pos).length()))
+            .filter(|(_, dist)| *dist <= Self::PROTRACTOR_HANDLE_RADIUS_PX * 1.5)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(arm, _)| arm)
+    }
+
+    /// Turn a protractor arm towards `window_pos`, limited to the half circle.
+    pub fn set_protractor_arm_towards(&mut self, arm: usize, window_pos: Vector2) {
+        let rel = window_pos - self.anchor;
+        let deg = rel
+            .dot(self.up())
+            .atan2(rel.dot(self.direction()))
+            .to_degrees();
+        // Below the base line the arm stays at the closer end of the half circle.
+        let deg = if deg < -90.0 {
+            180.0
+        } else {
+            deg.clamp(0.0, 180.0)
+        };
+        self.protractor_arms[arm] = deg;
+    }
+
+    /// The angle between the protractor arms in degrees.
+    pub fn protractor_angle(&self) -> f64 {
+        (self.protractor_arms[1] - self.protractor_arms[0]).abs()
+    }
+
+    /// Whether `window_pos` (in window coordinates) lies within the ruler body.
     pub fn hit_body_window(&self, window_pos: Vector2) -> bool {
         if !self.visible {
             return false;
         }
+        let rel = window_pos - self.anchor;
 
-        self.perp_distance(window_pos).abs() <= self.body_half_width
+        match self.kind {
+            RulerKind::Ruler => self.perp_distance(window_pos).abs() <= self.body_half_width,
+            RulerKind::SetSquare => {
+                // Above the long edge and below both short edges, which run at 45°.
+                let along = rel.dot(self.direction());
+                let up = rel.dot(self.up());
+                up >= 0.0 && up + along.abs() <= self.tool_size
+            }
+            RulerKind::Protractor => rel.dot(self.up()) >= 0.0 && rel.length() <= self.tool_size,
+        }
     }
 
-    /// If `pos_doc` lies within the snap zone of one of the ruler's long
-    /// edges, return the sign of the perpendicular (`+1.0` or `-1.0`) that
-    /// identifies that edge. `None` means no snap.
-    pub fn snap_side(&self, pos_doc: Vector2, view: RulerView) -> Option<f64> {
+    /// The distance around the ruler in which strokes snap to it, in surface pixels.
+    fn snap_distance_px(&self) -> f64 {
+        (self.snap_distance / 100.0) * 2.0 * self.body_half_width
+    }
+
+    fn snap_candidates(&self) -> Vec<SnapCandidate> {
+        let (dir, normal) = (self.direction(), self.normal());
+        let size = self.tool_size;
+        let line = |point: Vector2, dir: Vector2, outward: Vector2| SnapTarget::Line {
+            point,
+            dir,
+            outward,
+        };
+
+        match self.kind {
+            RulerKind::Ruler => Vec::from([1.0, -1.0].map(|side| SnapCandidate {
+                target: line(
+                    self.anchor + side * self.body_half_width * normal,
+                    dir,
+                    side * normal,
+                ),
+                range: None,
+                inside_body: false,
+            })),
+            RulerKind::SetSquare => {
+                let [left, right, top] = self.set_square_corners();
+                let leg = |from: Vector2| {
+                    let dir = (top - from).normalize();
+                    // Away from the opposite corner.
+                    let outward = Vector2::new(-dir.y, dir.x);
+                    let outward = if outward.dot(self.anchor - from) > 0.0 {
+                        -outward
+                    } else {
+                        outward
+                    };
+                    SnapCandidate {
+                        target: line(from, dir, outward),
+                        range: Some((0.0, size * std::f64::consts::SQRT_2)),
+                        inside_body: false,
+                    }
+                };
+                vec![
+                    SnapCandidate {
+                        target: line(self.anchor, dir, normal),
+                        range: Some((-size, size)),
+                        inside_body: false,
+                    },
+                    leg(left),
+                    leg(right),
+                ]
+            }
+            RulerKind::Protractor => {
+                let arm_len = size + Self::PROTRACTOR_ARM_EXTENSION_PX;
+                let mut candidates = vec![
+                    SnapCandidate {
+                        target: line(self.anchor, dir, normal),
+                        range: Some((-size, size)),
+                        inside_body: false,
+                    },
+                    SnapCandidate {
+                        target: SnapTarget::Arc {
+                            center: self.anchor,
+                            radius: size,
+                        },
+                        range: Some((0.0, size)),
+                        inside_body: false,
+                    },
+                ];
+                // The arms can be drawn along from inside, too, starting at the center.
+                candidates.extend(self.protractor_arms.map(|arm_deg| {
+                    let arm_dir = self.protractor_arm_direction(arm_deg);
+                    SnapCandidate {
+                        target: line(self.anchor, arm_dir, Vector2::new(-arm_dir.y, arm_dir.x)),
+                        range: Some((0.0, arm_len)),
+                        inside_body: true,
+                    }
+                }));
+                candidates
+            }
+        }
+    }
+
+    /// The edge of the ruler that a stroke starting at `pos_doc` snaps to, if it is close
+    /// enough to one.
+    pub fn snap_target(&self, pos_doc: Vector2, view: RulerView) -> Option<SnapTarget> {
         if !self.visible {
             return None;
         }
-        let half_w = self.body_half_width;
-        let snap_dist = (self.snap_distance / 100.0) * 2.0 * half_w;
-        let perp = self.perp_distance(view.from_doc(pos_doc));
-        if perp.abs() - half_w > snap_dist {
-            None
-        } else {
-            Some(if perp >= 0.0 { 1.0 } else { -1.0 })
-        }
+        let pos = view.from_doc(pos_doc);
+        let snap_dist = self.snap_distance_px();
+        let inside_body = self.hit_body_window(pos);
+
+        self.snap_candidates()
+            .into_iter()
+            .filter(|candidate| !inside_body || candidate.inside_body)
+            .filter(|candidate| {
+                let Some((min, max)) = candidate.range else {
+                    return true;
+                };
+                let along = match candidate.target {
+                    SnapTarget::Line { point, dir, .. } => (pos - point).dot(dir),
+                    SnapTarget::Arc { center, .. } => (pos - center).dot(self.up()),
+                };
+                along >= min - snap_dist && along <= max + snap_dist
+            })
+            .map(|candidate| (candidate.target, candidate.target.distance(pos)))
+            .filter(|(_, dist)| *dist <= snap_dist)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(target, _)| target)
     }
 
-    /// Project `pos_doc` onto the long edge identified by `side` (`+1.0` or
-    /// `-1.0`), regardless of distance. Used to keep a stroke locked to the
-    /// ruler once it has snapped.
-    pub fn project_to_edge(&self, pos_doc: Vector2, side: f64, view: RulerView) -> Vector2 {
-        let pos_window = view.from_doc(pos_doc);
-        let dir = self.direction();
-        let normal = self.normal();
-        let along = (pos_window - self.anchor).dot(dir);
-        let snapped_window = self.anchor + along * dir + side * self.body_half_width * normal;
-
-        view.to_doc(snapped_window)
+    /// Project `pos_doc` onto the snap target, regardless of distance. Used to keep a stroke
+    /// locked to the ruler once it has snapped.
+    pub fn project_to_target(
+        &self,
+        pos_doc: Vector2,
+        target: SnapTarget,
+        view: RulerView,
+    ) -> Vector2 {
+        view.to_doc(target.project(view.from_doc(pos_doc)))
     }
 
     /// Normalize an angle (radians) to the displayable principal angle in
@@ -456,7 +708,11 @@ mod tests {
         let view = view(2.5, Vector2::new(120.0, 0.0));
         let pos_window = Vector2::new(320.0, 190.0);
 
-        let projected = view.from_doc(ruler.project_to_edge(view.to_doc(pos_window), 1.0, view));
+        let target = ruler
+            .snap_target(view.to_doc(pos_window + Vector2::new(0.0, 40.0)), view)
+            .unwrap();
+        let projected =
+            view.from_doc(ruler.project_to_target(view.to_doc(pos_window), target, view));
 
         // Keeps its position along the ruler, and sits exactly one half width off the centerline.
         assert!((projected.x - pos_window.x).abs() < 1e-9);
@@ -493,13 +749,98 @@ mod tests {
         // half-width past the edge: 60 + 30 = 90 pixels on screen.
         for total_zoom in [0.2, 1.0, 6.0] {
             let view = view(total_zoom, Vector2::new(180.0, 40.0));
+            // The side of the edge the stroke snaps to.
             let at = |offset: f64| {
-                ruler.snap_side(view.to_doc(ruler.anchor + Vector2::new(0.0, offset)), view)
+                ruler
+                    .snap_target(view.to_doc(ruler.anchor + Vector2::new(0.0, offset)), view)
+                    .map(|target| match target {
+                        SnapTarget::Line { outward, .. } => outward.y,
+                        SnapTarget::Arc { .. } => panic!("the ruler has no arc"),
+                    })
             };
 
             assert_eq!(at(85.0), Some(1.0), "zoom {total_zoom}");
             assert_eq!(at(-85.0), Some(-1.0), "zoom {total_zoom}");
             assert_eq!(at(95.0), None, "zoom {total_zoom}");
         }
+    }
+
+    fn tool(kind: RulerKind) -> RulerConfig {
+        RulerConfig {
+            kind,
+            tool_size: 200.0,
+            ..horizontal_ruler()
+        }
+    }
+
+    #[test]
+    fn set_square_body_and_edges() {
+        let set_square = tool(RulerKind::SetSquare);
+        let view = view(1.0, Vector2::ZERO);
+        let anchor = set_square.anchor;
+        // The body is above the long edge (the normal points down on screen).
+        assert!(set_square.hit_body_window(anchor + Vector2::new(0.0, -100.0)));
+        assert!(set_square.hit_body_window(anchor + Vector2::new(90.0, -100.0)));
+        assert!(!set_square.hit_body_window(anchor + Vector2::new(110.0, -100.0)));
+        assert!(!set_square.hit_body_window(anchor + Vector2::new(0.0, 10.0)));
+
+        // Below the long edge it snaps to it, left of the right short edge to that.
+        let snap = |pos: Vector2| {
+            set_square
+                .snap_target(view.to_doc(pos), view)
+                .map(|target| target.project(pos))
+        };
+        let on_long_edge = snap(anchor + Vector2::new(50.0, 20.0)).unwrap();
+        assert!((on_long_edge - (anchor + Vector2::new(50.0, 0.0))).length() < 1e-9);
+        let on_short_edge = snap(anchor + Vector2::new(115.0, -100.0)).unwrap();
+        // The short edges run at 45°.
+        let rel = on_short_edge - anchor;
+        assert!((rel.x - rel.y - 200.0).abs() < 1e-9, "{rel:?}");
+        // Far away there is nothing to snap to.
+        assert_eq!(snap(anchor + Vector2::new(0.0, 200.0)), None);
+        assert_eq!(snap(anchor + Vector2::new(400.0, 20.0)), None);
+    }
+
+    #[test]
+    fn protractor_arms_and_arc() {
+        let mut protractor = tool(RulerKind::Protractor);
+        let view = view(1.0, Vector2::ZERO);
+        let anchor = protractor.anchor;
+
+        // The arm follows the pointer, but not below the base line.
+        protractor.set_protractor_arm_towards(1, anchor + Vector2::new(-100.0, -100.0));
+        assert!((protractor.protractor_arms[1] - 135.0).abs() < 1e-9);
+        protractor.set_protractor_arm_towards(1, anchor + Vector2::new(-100.0, 20.0));
+        assert!((protractor.protractor_arms[1] - 180.0).abs() < 1e-9);
+        protractor.set_protractor_arm_towards(1, anchor + Vector2::new(100.0, 20.0));
+        assert_eq!(protractor.protractor_arms[1], 0.0);
+        protractor.protractor_arms = [20.0, 60.0];
+        assert!((protractor.protractor_angle() - 40.0).abs() < 1e-9);
+
+        // The handles can be grabbed.
+        let handle = protractor.protractor_handle_pos(1);
+        assert_eq!(protractor.hit_protractor_handle_window(handle), Some(1));
+        assert_eq!(protractor.hit_protractor_handle_window(anchor), None);
+
+        // Inside the body strokes snap to the arms, outside to the arc.
+        let arm_dir = protractor.protractor_arm_direction(60.0);
+        let near_arm = anchor + arm_dir * 100.0 + Vector2::new(3.0, 0.0);
+        assert!(protractor.hit_body_window(near_arm));
+        let target = protractor.snap_target(view.to_doc(near_arm), view).unwrap();
+        let projected = target.project(near_arm) - anchor;
+        assert!((projected.normalize() - arm_dir).length() < 1e-9);
+
+        let near_arc = anchor + Vector2::new(0.0, -215.0);
+        assert_eq!(
+            protractor.snap_target(view.to_doc(near_arc), view),
+            Some(SnapTarget::Arc {
+                center: anchor,
+                radius: 200.0
+            })
+        );
+        // Away from the arms, the body is dragged instead.
+        let inside = anchor + protractor.protractor_arm_direction(140.0) * 100.0;
+        assert_eq!(protractor.snap_target(view.to_doc(inside), view), None);
+        assert!(protractor.hit_body_window(inside));
     }
 }

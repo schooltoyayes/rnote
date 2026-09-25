@@ -11,6 +11,7 @@ use rnote_compose::style::PressureCurve;
 use rnote_compose::style::textured::{TexturedDotsDistribution, TexturedOptions};
 use rnote_engine::pens::pensconfig::BrushConfig;
 use rnote_engine::pens::pensconfig::brushconfig::{BrushStyle, SolidOptions};
+use rnote_engine::pens::pensconfig::rulerconfig::RulerKind;
 use std::cell::Cell;
 
 mod imp {
@@ -57,6 +58,14 @@ mod imp {
         pub(crate) stroke_width_picker: TemplateChild<RnStrokeWidthPicker>,
         #[template_child]
         pub(crate) ruler_toggle: TemplateChild<ToggleButton>,
+        #[template_child]
+        pub(crate) set_square_toggle: TemplateChild<ToggleButton>,
+        #[template_child]
+        pub(crate) protractor_toggle: TemplateChild<ToggleButton>,
+        /// Set while the ruler toggles get synced to the ruler, so the sync does not change it.
+        pub(crate) ruler_toggles_syncing: Cell<bool>,
+        #[template_child]
+        pub(crate) ruler_tool_size_row: TemplateChild<adw::SpinRow>,
         #[template_child]
         pub(crate) ruler_menubutton: TemplateChild<MenuButton>,
         #[template_child]
@@ -455,38 +464,40 @@ impl RnBrushPage {
                 }
             ));
 
-        // Ruler toggle: enables/disables the on-canvas ruler. The first time the
-        // user enables it, seed the ruler position to the current viewport center.
-        imp.ruler_toggle.connect_toggled(clone!(
-            #[weak]
-            appwindow,
-            move |toggle| {
-                let visible = toggle.is_active();
-                let needs_seed = {
-                    let mut config = appwindow.engine_config().write();
-                    let ruler = &mut config.pens_config.brush_config.ruler_config;
-                    ruler.visible = visible;
-                    visible && ruler.anchor == p2d::math::Vector2::ZERO
-                };
-                if let Some(canvas) = appwindow.active_tab_canvas() {
-                    if needs_seed {
-                        // The ruler position is in window coordinates — seed it to the center
-                        // of the visible area, which is what the canvas wrapper covers.
-                        let center_window = appwindow
-                            .active_tab_wrapper()
-                            .map(|w| {
-                                p2d::math::Vector2::new(w.width() as f64, w.height() as f64) * 0.5
-                            })
-                            .unwrap_or_else(|| canvas.engine_ref().camera.size() * 0.5);
-                        let mut c = appwindow.engine_config().write();
-                        let r = &mut c.pens_config.brush_config.ruler_config;
-                        r.anchor = center_window;
-                        r.dial_pos = center_window;
+        // Ruler toggles: show the ruler, the set square or the protractor, only one of them at
+        // a time, or hide them. The first time one is shown, seed its position to the current
+        // viewport center.
+        for (toggle, kind) in self.ruler_toggles() {
+            toggle.connect_toggled(clone!(
+                #[weak(rename_to=brushpage)]
+                self,
+                #[weak]
+                appwindow,
+                move |toggle| {
+                    if brushpage.imp().ruler_toggles_syncing.get() {
+                        return;
                     }
-                    canvas.queue_draw();
+                    let visible = toggle.is_active();
+                    if visible {
+                        brushpage.sync_ruler_toggles(true, kind);
+                    }
+                    let needs_seed = {
+                        let mut config = appwindow.engine_config().write();
+                        let ruler = &mut config.pens_config.brush_config.ruler_config;
+                        ruler.visible = visible;
+                        if visible {
+                            ruler.kind = kind;
+                            if kind != RulerKind::Ruler {
+                                // Turns around the middle of its long edge, see the dial.
+                                ruler.dial_pos = ruler.anchor;
+                            }
+                        }
+                        visible && ruler.anchor == p2d::math::Vector2::ZERO
+                    };
+                    brushpage.seed_ruler_position(&appwindow, needs_seed);
                 }
-            }
-        ));
+            ));
+        }
 
         let ruler_popover = imp.ruler_popover.get();
         imp.ruler_popover_close_button.connect_clicked(clone!(
@@ -608,6 +619,24 @@ impl RnBrushPage {
             }
         ));
 
+        // Set square and protractor size: the UI exposes the full length; storage uses half.
+        imp.ruler_tool_size_row.get().connect_changed(clone!(
+            #[weak]
+            appwindow,
+            move |row| {
+                appwindow
+                    .engine_config()
+                    .write()
+                    .pens_config
+                    .brush_config
+                    .ruler_config
+                    .tool_size = row.value() * 0.5;
+                if let Some(canvas) = appwindow.active_tab_canvas() {
+                    canvas.queue_draw();
+                }
+            }
+        ));
+
         // Ruler width: the UI exposes the full width; storage uses the half-width.
         imp.ruler_width_row.get().connect_changed(clone!(
             #[weak]
@@ -707,8 +736,12 @@ impl RnBrushPage {
             }
         }
 
-        imp.ruler_toggle
-            .set_active(brush_config.ruler_config.visible);
+        self.sync_ruler_toggles(
+            brush_config.ruler_config.visible,
+            brush_config.ruler_config.kind,
+        );
+        imp.ruler_tool_size_row
+            .set_value(brush_config.ruler_config.tool_size * 2.0);
         imp.ruler_metric_scale_row
             .set_active(brush_config.ruler_config.metric_scale);
         imp.ruler_tick_spacing_row
@@ -728,6 +761,46 @@ impl RnBrushPage {
         imp.ruler_scroll_step_row
             .set_value(brush_config.ruler_config.scroll_rotation_step_deg);
         self.sync_ruler_angle_row(brush_config.ruler_config.displayed_angle_deg());
+    }
+
+    fn ruler_toggles(&self) -> [(ToggleButton, RulerKind); 3] {
+        let imp = self.imp();
+        [
+            (imp.ruler_toggle.get(), RulerKind::Ruler),
+            (imp.set_square_toggle.get(), RulerKind::SetSquare),
+            (imp.protractor_toggle.get(), RulerKind::Protractor),
+        ]
+    }
+
+    /// Activate the toggle of the visible ruler kind, and only that.
+    fn sync_ruler_toggles(&self, visible: bool, visible_kind: RulerKind) {
+        let imp = self.imp();
+        imp.ruler_toggles_syncing.set(true);
+        for (toggle, kind) in self.ruler_toggles() {
+            toggle.set_active(visible && kind == visible_kind);
+        }
+        imp.ruler_toggles_syncing.set(false);
+    }
+
+    /// Redraw after the ruler was shown or hidden. With `seed` the ruler is placed in the middle
+    /// of the visible area first.
+    fn seed_ruler_position(&self, appwindow: &RnAppWindow, seed: bool) {
+        let Some(canvas) = appwindow.active_tab_canvas() else {
+            return;
+        };
+        if seed {
+            // The ruler position is in window coordinates — seed it to the center
+            // of the visible area, which is what the canvas wrapper covers.
+            let center_window = appwindow
+                .active_tab_wrapper()
+                .map(|w| p2d::math::Vector2::new(w.width() as f64, w.height() as f64) * 0.5)
+                .unwrap_or_else(|| canvas.engine_ref().camera.size() * 0.5);
+            let mut c = appwindow.engine_config().write();
+            let r = &mut c.pens_config.brush_config.ruler_config;
+            r.anchor = center_window;
+            r.dial_pos = center_window;
+        }
+        canvas.queue_draw();
     }
 
     fn sync_ruler_angle_row(&self, angle_deg: f64) {

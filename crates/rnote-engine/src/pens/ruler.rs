@@ -1,6 +1,6 @@
 // Imports
 use crate::document::format::MeasureUnit;
-use crate::pens::pensconfig::rulerconfig::{RulerConfig, RulerView};
+use crate::pens::pensconfig::rulerconfig::{RulerConfig, RulerKind, RulerView, SnapTarget};
 use p2d::bounding_volume::Aabb;
 use p2d::math::Vector2;
 use piet::{RenderContext, Text, TextLayout, TextLayoutBuilder};
@@ -38,6 +38,36 @@ const SCALE_LABEL_SIZE_PX: f64 = 11.0;
 const MEASUREMENT_TEXT_SIZE_PX: f64 = 13.0;
 /// Distance between the drawn stroke and its length label, in surface pixels.
 const MEASUREMENT_OFFSET_PX: f64 = 10.0;
+/// On the degree scale, labels closer than this are left out, in surface pixels.
+const DEGREE_MIN_LABEL_SPACING_PX: f64 = 26.0;
+/// Radius of the arc between the protractor arms, in surface pixels.
+const PROTRACTOR_ANGLE_ARC_RADIUS_PX: f64 = 36.0;
+/// Distance of the angle between the protractor arms from their center, in surface pixels.
+const PROTRACTOR_ANGLE_TEXT_RADIUS_PX: f64 = 62.0;
+
+/// The steps of the degree scale in degrees for the given on-screen length of a degree: between
+/// the ticks, between the medium ticks if there are any, and between the labelled ticks. All of
+/// them divide 180°, so both ends of the scale are labelled.
+fn degree_steps(px_per_deg: f64) -> (i64, Option<i64>, i64) {
+    const TICK_STEPS: [i64; 5] = [1, 5, 10, 30, 90];
+    const LABEL_STEPS: [i64; 3] = [10, 30, 90];
+    let fits = |step: i64, min_px: f64| step as f64 * px_per_deg >= min_px;
+
+    let tick = TICK_STEPS
+        .into_iter()
+        .find(|step| fits(*step, METRIC_MIN_TICK_SPACING_PX))
+        .unwrap_or(90);
+    let label = LABEL_STEPS
+        .into_iter()
+        .filter(|step| *step >= tick)
+        .find(|step| fits(*step, DEGREE_MIN_LABEL_SPACING_PX))
+        .unwrap_or(90);
+    let medium = TICK_STEPS
+        .into_iter()
+        .find(|step| *step > tick)
+        .filter(|step| *step < label && label % step == 0);
+    (tick, medium, label)
+}
 
 /// The steps of the metric scale in millimeters for the given on-screen length of a
 /// millimeter: between the ticks, between the medium ticks if there are any, and between the
@@ -160,8 +190,23 @@ fn viewport_t_range(
     Some((min_t - pad, max_t + pad))
 }
 
-/// Draw the ruler band across the visible area with tick marks on its long
-/// edges and an angle dial.
+/// What is needed to draw the ruler at the current zoom.
+struct DrawParams {
+    view: RulerView,
+    total_zoom: f64,
+    dark_mode: bool,
+    /// The length of a millimeter in document coordinates.
+    mm_doc: f64,
+}
+
+impl DrawParams {
+    /// Convert a length in surface pixels to document coordinates.
+    fn px(&self, px: f64) -> f64 {
+        px / self.total_zoom
+    }
+}
+
+/// Draw the ruler: a band across the visible area, a set square or a protractor.
 ///
 /// `visible_doc` is the whole area visible on screen in document coordinates,
 /// which in the bounded layouts extends past the document itself. The ruler
@@ -179,140 +224,413 @@ pub fn draw_ruler_on_doc(
     if !ruler.visible {
         return Ok(());
     }
-    let total_zoom = view.total_zoom();
-    let dark_mode = RulerConfig::dark_mode_for_background(background_color);
-    let anchor_doc = ruler.anchor_doc(view);
+    let params = DrawParams {
+        view,
+        total_zoom: view.total_zoom(),
+        dark_mode: RulerConfig::dark_mode_for_background(background_color),
+        mm_doc: doc_dpi / MeasureUnit::AMOUNT_MM_IN_INCH,
+    };
+
+    cx.save().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    match ruler.kind {
+        RulerKind::Ruler => draw_straight_ruler(cx, ruler, visible_doc, &params)?,
+        RulerKind::SetSquare => draw_set_square(cx, ruler, &params)?,
+        RulerKind::Protractor => draw_protractor(cx, ruler, &params)?,
+    }
+    draw_measurement(cx, ruler, &params)?;
+    cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(())
+}
+
+/// Fill and outline the ruler body.
+fn draw_body(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    body: kurbo::BezPath,
+    params: &DrawParams,
+) {
+    cx.fill(body.clone(), &ruler.body_fill_color(params.dark_mode));
+    cx.stroke(
+        body,
+        &RulerConfig::body_stroke_color(params.dark_mode),
+        params.px(1.0),
+    );
+}
+
+fn draw_straight_ruler(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    visible_doc: Aabb,
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    let anchor_doc = ruler.anchor_doc(params.view);
     let dir = ruler.direction();
     let normal = ruler.normal();
-    let half_w = ruler.body_half_width_doc(total_zoom);
+    let half_w = ruler.body_half_width_doc(params.total_zoom);
     let Some((min_t, max_t)) = viewport_t_range(anchor_doc, dir, half_w, visible_doc) else {
         return Ok(());
     };
 
     let p_start = anchor_doc + min_t * dir;
     let p_end = anchor_doc + max_t * dir;
-    let edge_a_s = p_start + half_w * normal;
-    let edge_a_e = p_end + half_w * normal;
-    let edge_b_s = p_start - half_w * normal;
-    let edge_b_e = p_end - half_w * normal;
-
-    cx.save().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    // Body fill + outline. Fill opacity is user-configurable.
     let mut body = kurbo::BezPath::new();
-    body.move_to(edge_a_s.to_kurbo_point());
-    body.line_to(edge_a_e.to_kurbo_point());
-    body.line_to(edge_b_e.to_kurbo_point());
-    body.line_to(edge_b_s.to_kurbo_point());
+    body.move_to((p_start + half_w * normal).to_kurbo_point());
+    body.line_to((p_end + half_w * normal).to_kurbo_point());
+    body.line_to((p_end - half_w * normal).to_kurbo_point());
+    body.line_to((p_start - half_w * normal).to_kurbo_point());
     body.close_path();
-    cx.fill(body.clone(), &ruler.body_fill_color(dark_mode));
-    cx.stroke(
-        body,
-        &RulerConfig::body_stroke_color(dark_mode),
-        1.0 / total_zoom,
-    );
+    draw_body(cx, ruler, body, params);
 
-    // Tick marks on the long edges, three-tier (minor / medium / major). On the
-    // metric scale they are millimeters and centimeters of the document with zero
-    // at the anchor, otherwise they have a fixed spacing in surface pixels and
-    // are independent of the document.
-    let mm_doc = doc_dpi / MeasureUnit::AMOUNT_MM_IN_INCH;
-    let (tick_step, medium_step, major_step) = if ruler.metric_scale {
-        metric_steps_mm(mm_doc * total_zoom)
-    } else {
-        (1, Some(5), 10)
-    };
-    let spacing = if ruler.metric_scale {
-        tick_step as f64 * mm_doc
-    } else {
-        ruler.tick_spacing / total_zoom
-    };
-    let tick_major = RulerConfig::TICK_MAJOR_LEN_PX / total_zoom;
-    let tick_medium = EDGE_TICK_MEDIUM_LEN_PX / total_zoom;
-    let tick_minor = RulerConfig::TICK_MINOR_LEN_PX / total_zoom;
-    let tick_w = 1.0 / total_zoom;
-    let i_min = (min_t / spacing).ceil() as i64;
-    let i_max = (max_t / spacing).floor() as i64;
-    const MAX_TICKS: i64 = 4096;
-    if i_max - i_min > MAX_TICKS {
-        cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-        return Ok(());
-    }
-    // Positions along the ruler and values of the labelled ticks.
-    let mut labels = Vec::new();
-    for i in i_min..=i_max {
-        let t = i as f64 * spacing;
-        let p = anchor_doc + t * dir;
-        let value = i * tick_step;
-        let len = if value.rem_euclid(major_step) == 0 {
-            if ruler.metric_scale {
-                // Whole centimeters.
-                labels.push((p, value.abs() / 10));
-            }
-            tick_major
-        } else if medium_step.is_some_and(|step| value.rem_euclid(step) == 0) {
-            tick_medium
-        } else {
-            tick_minor
-        };
-        let a_outer = p + half_w * normal;
-        let a_inner = p + (half_w - len) * normal;
-        cx.stroke(
-            kurbo::Line::new(a_outer.to_kurbo_point(), a_inner.to_kurbo_point()),
-            &RulerConfig::tick_color(dark_mode),
-            tick_w,
-        );
-        let b_outer = p - half_w * normal;
-        let b_inner = p - (half_w - len) * normal;
-        cx.stroke(
-            kurbo::Line::new(b_outer.to_kurbo_point(), b_inner.to_kurbo_point()),
-            &RulerConfig::tick_color(dark_mode),
-            tick_w,
-        );
-    }
-
-    // The labels sit inside the body next to the major ticks of both edges.
-    let label_rotation = upright_angle(ruler.angle);
-    let label_inset = (RulerConfig::TICK_MAJOR_LEN_PX + SCALE_LABEL_SIZE_PX * 0.9) / total_zoom;
-    for (p, value) in labels {
-        for side in [1.0, -1.0] {
-            draw_label(
-                cx,
-                value.to_string(),
-                SCALE_LABEL_SIZE_PX,
-                RulerConfig::tick_color(dark_mode),
-                None,
-                p + side * (half_w - label_inset) * normal,
-                label_rotation,
-                None,
-                total_zoom,
-            )?;
-        }
-    }
-
-    // The length of the stroke that is drawn along the ruler, next to its end
-    // and outside the ruler.
-    if let Some(measurement) = ruler.measurement {
-        let length_cm = (measurement.end - measurement.start).length() / mm_doc / 10.0;
-        draw_label(
+    // Tick marks on both long edges.
+    for side in [1.0, -1.0] {
+        draw_edge_scale(
             cx,
-            format!("{length_cm:.1} cm"),
-            MEASUREMENT_TEXT_SIZE_PX,
-            RulerConfig::angle_text_color(dark_mode),
-            Some(RulerConfig::measurement_background_color(dark_mode)),
-            measurement.end,
-            0.0,
-            Some(measurement.side * normal),
-            total_zoom,
+            ruler,
+            anchor_doc + side * half_w * normal,
+            dir,
+            -side * normal,
+            (min_t, max_t),
+            params,
         )?;
     }
 
     if ruler.show_dial {
-        draw_angle_dial(cx, ruler, ruler.dial_pos_doc(view), total_zoom, dark_mode)?;
+        draw_angle_dial(
+            cx,
+            ruler,
+            ruler.dial_pos_doc(params.view),
+            params.total_zoom,
+            params.dark_mode,
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_set_square(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    let anchor_doc = ruler.anchor_doc(params.view);
+    let dir = ruler.direction();
+    let up = -ruler.normal();
+    let size = params.px(ruler.tool_size);
+
+    let [left, right, top] = ruler
+        .set_square_corners()
+        .map(|corner| params.view.to_doc(corner));
+    let mut body = kurbo::BezPath::new();
+    body.move_to(left.to_kurbo_point());
+    body.line_to(right.to_kurbo_point());
+    body.line_to(top.to_kurbo_point());
+    body.close_path();
+    draw_body(cx, ruler, body, params);
+
+    // The centimeter scale along the long edge, zero in its middle.
+    draw_edge_scale(cx, ruler, anchor_doc, dir, up, (-size, size), params)?;
+
+    // The degree scale around the middle of the long edge, and the perpendicular
+    // through it. It has to stay inside the short edges, which are
+    // `size / sqrt(2)` away from the middle.
+    let scale_radius = size * 0.62;
+    draw_degree_scale(cx, ruler, anchor_doc, scale_radius, false, params)?;
+    cx.stroke(
+        kurbo::Line::new(
+            anchor_doc.to_kurbo_point(),
+            (anchor_doc + up * (scale_radius - params.px(RulerConfig::TICK_MAJOR_LEN_PX)))
+                .to_kurbo_point(),
+        ),
+        &RulerConfig::tick_color(params.dark_mode),
+        params.px(1.0),
+    );
+
+    if ruler.show_dial {
+        draw_label(
+            cx,
+            rotation_text(ruler),
+            ANGLE_TEXT_SIZE_PX,
+            RulerConfig::angle_text_color(params.dark_mode),
+            None,
+            anchor_doc + up * size * 0.2,
+            0.0,
+            None,
+            params.total_zoom,
+        )?;
+    }
+    Ok(())
+}
+
+fn draw_protractor(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    let anchor_doc = ruler.anchor_doc(params.view);
+    let dir = ruler.direction();
+    let radius = params.px(ruler.tool_size);
+
+    // The half circle above the base line. `up` is a quarter turn
+    // counterclockwise on screen from `dir`, so the arc sweeps backwards.
+    let mut body = kurbo::BezPath::new();
+    body.move_to((anchor_doc + radius * dir).to_kurbo_point());
+    body.extend(
+        kurbo::Arc::new(
+            anchor_doc.to_kurbo_point(),
+            (radius, radius),
+            ruler.angle,
+            -std::f64::consts::PI,
+            0.0,
+        )
+        .append_iter(0.1 * params.px(1.0)),
+    );
+    body.close_path();
+    draw_body(cx, ruler, body, params);
+
+    draw_degree_scale(cx, ruler, anchor_doc, radius, true, params)?;
+
+    // The center of the base line, where the arms meet.
+    cx.fill(
+        kurbo::Circle::new(anchor_doc.to_kurbo_point(), params.px(2.5)),
+        &RulerConfig::tick_color(params.dark_mode),
+    );
+
+    // The arms with their handles.
+    let arm_len = radius + params.px(RulerConfig::PROTRACTOR_ARM_EXTENSION_PX);
+    for arm in 0..ruler.protractor_arms.len() {
+        let arm_dir = ruler.protractor_arm_direction(ruler.protractor_arms[arm]);
+        cx.stroke(
+            kurbo::Line::new(
+                anchor_doc.to_kurbo_point(),
+                (anchor_doc + arm_len * arm_dir).to_kurbo_point(),
+            ),
+            &INDICATOR_COLOR,
+            params.px(1.5),
+        );
+        let handle = kurbo::Circle::new(
+            params
+                .view
+                .to_doc(ruler.protractor_handle_pos(arm))
+                .to_kurbo_point(),
+            params.px(RulerConfig::PROTRACTOR_HANDLE_RADIUS_PX),
+        );
+        cx.fill(handle, &INDICATOR_COLOR.with_alpha(0.35));
+        cx.stroke(handle, &INDICATOR_COLOR, params.px(1.5));
     }
 
-    cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    // The angle between the arms, with an arc from one arm to the other.
+    let [arm_a, arm_b] = ruler.protractor_arms;
+    let angle_arc_radius = params.px(PROTRACTOR_ANGLE_ARC_RADIUS_PX);
+    let mut angle_arc = kurbo::BezPath::new();
+    angle_arc.move_to(
+        (anchor_doc + angle_arc_radius * ruler.protractor_arm_direction(arm_a)).to_kurbo_point(),
+    );
+    angle_arc.extend(
+        kurbo::Arc::new(
+            anchor_doc.to_kurbo_point(),
+            (angle_arc_radius, angle_arc_radius),
+            ruler.angle - arm_a.to_radians(),
+            -(arm_b - arm_a).to_radians(),
+            0.0,
+        )
+        .append_iter(0.1 * params.px(1.0)),
+    );
+    cx.stroke(angle_arc, &INDICATOR_COLOR, params.px(1.5));
+    let bisector = ruler.protractor_arm_direction((arm_a + arm_b) * 0.5);
+    draw_label(
+        cx,
+        degrees_text(ruler.protractor_angle()),
+        MEASUREMENT_TEXT_SIZE_PX,
+        RulerConfig::angle_text_color(params.dark_mode),
+        Some(RulerConfig::measurement_background_color(params.dark_mode)),
+        anchor_doc + bisector * params.px(PROTRACTOR_ANGLE_TEXT_RADIUS_PX),
+        0.0,
+        None,
+        params.total_zoom,
+    )?;
     Ok(())
+}
+
+/// Draw tick marks along an edge, which runs through `origin` along `dir`, into the direction
+/// `inward`. On the metric scale they are millimeters and centimeters of the document with zero
+/// at the origin, otherwise they have a fixed spacing in surface pixels and are independent of
+/// the document. `t_range` limits them to a part of the edge.
+fn draw_edge_scale(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    origin: Vector2,
+    dir: Vector2,
+    inward: Vector2,
+    (min_t, max_t): (f64, f64),
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    const MAX_TICKS: i64 = 4096;
+
+    let (tick_step, medium_step, major_step) = if ruler.metric_scale {
+        metric_steps_mm(params.mm_doc * params.total_zoom)
+    } else {
+        (1, Some(5), 10)
+    };
+    let spacing = if ruler.metric_scale {
+        tick_step as f64 * params.mm_doc
+    } else {
+        params.px(ruler.tick_spacing)
+    };
+    let i_min = (min_t / spacing).ceil() as i64;
+    let i_max = (max_t / spacing).floor() as i64;
+    if i_max - i_min > MAX_TICKS {
+        return Ok(());
+    }
+    let tick_color = RulerConfig::tick_color(params.dark_mode);
+    let label_inset = params.px(RulerConfig::TICK_MAJOR_LEN_PX + SCALE_LABEL_SIZE_PX * 0.9);
+
+    for i in i_min..=i_max {
+        let p = origin + i as f64 * spacing * dir;
+        let value = i * tick_step;
+        let is_major = value.rem_euclid(major_step) == 0;
+        let len = if is_major {
+            RulerConfig::TICK_MAJOR_LEN_PX
+        } else if medium_step.is_some_and(|step| value.rem_euclid(step) == 0) {
+            EDGE_TICK_MEDIUM_LEN_PX
+        } else {
+            RulerConfig::TICK_MINOR_LEN_PX
+        };
+        cx.stroke(
+            kurbo::Line::new(
+                p.to_kurbo_point(),
+                (p + params.px(len) * inward).to_kurbo_point(),
+            ),
+            &tick_color,
+            params.px(1.0),
+        );
+        // Whole centimeters next to the major ticks.
+        if is_major && ruler.metric_scale {
+            draw_label(
+                cx,
+                (value.abs() / 10).to_string(),
+                SCALE_LABEL_SIZE_PX,
+                tick_color,
+                None,
+                p + label_inset * inward,
+                upright_angle(ruler.angle),
+                None,
+                params.total_zoom,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Draw a degree scale from 0° to 180° on the half circle around `center`, on the side of the
+/// set square and the protractor. The ticks point inward, the degrees are labelled twice, once
+/// counting from each end.
+///
+/// Without `with_ends` the ticks at 0° and 180° are left out, where the half circle meets the
+/// long edge of the set square.
+fn draw_degree_scale(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    center: Vector2,
+    radius: f64,
+    with_ends: bool,
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    let px_per_deg = radius * params.total_zoom * std::f64::consts::PI / 180.0;
+    let (tick_step, medium_step, label_step) = degree_steps(px_per_deg);
+    let tick_color = RulerConfig::tick_color(params.dark_mode);
+    let label_rotation = upright_angle(ruler.angle);
+    let outer_row = radius - params.px(RulerConfig::TICK_MAJOR_LEN_PX + SCALE_LABEL_SIZE_PX);
+    let inner_row = outer_row - params.px(SCALE_LABEL_SIZE_PX * 1.6);
+
+    for deg in (0..=180).step_by(tick_step as usize) {
+        let is_end = deg == 0 || deg == 180;
+        if is_end && !with_ends {
+            continue;
+        }
+        let unit = ruler.protractor_arm_direction(deg as f64);
+        // The labels at the ends lie on the base line, move them onto the body.
+        let label_shift = if is_end {
+            params.px(SCALE_LABEL_SIZE_PX * 0.8) * -ruler.normal()
+        } else {
+            Vector2::ZERO
+        };
+        let is_labelled = deg % label_step == 0;
+        let len = if is_labelled {
+            RulerConfig::TICK_MAJOR_LEN_PX
+        } else if medium_step.is_some_and(|step| deg % step == 0) {
+            EDGE_TICK_MEDIUM_LEN_PX
+        } else {
+            RulerConfig::TICK_MINOR_LEN_PX
+        };
+        cx.stroke(
+            kurbo::Line::new(
+                (center + radius * unit).to_kurbo_point(),
+                (center + (radius - params.px(len)) * unit).to_kurbo_point(),
+            ),
+            &tick_color,
+            params.px(1.0),
+        );
+        if is_labelled {
+            for (row, value) in [(outer_row, deg), (inner_row, 180 - deg)] {
+                draw_label(
+                    cx,
+                    value.to_string(),
+                    SCALE_LABEL_SIZE_PX,
+                    tick_color,
+                    None,
+                    center + row * unit + label_shift,
+                    label_rotation,
+                    None,
+                    params.total_zoom,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The length or the angle of the stroke that is drawn along the ruler, next to its end and
+/// outside the ruler.
+fn draw_measurement(
+    cx: &mut piet_cairo::CairoRenderContext,
+    ruler: &RulerConfig,
+    params: &DrawParams,
+) -> anyhow::Result<()> {
+    let Some(measurement) = ruler.measurement else {
+        return Ok(());
+    };
+    let (text, outward) = match measurement.target {
+        SnapTarget::Line { outward, .. } => {
+            let length_cm = (measurement.end - measurement.start).length() / params.mm_doc / 10.0;
+            (format!("{length_cm:.1} cm"), outward)
+        }
+        SnapTarget::Arc { center, .. } => {
+            let center = params.view.to_doc(center);
+            let (from, to) = (measurement.start - center, measurement.end - center);
+            let angle = from.perp_dot(to).atan2(from.dot(to)).abs().to_degrees();
+            (
+                degrees_text(angle),
+                (measurement.end - center)
+                    .try_normalize()
+                    .unwrap_or(Vector2::X),
+            )
+        }
+    };
+    draw_label(
+        cx,
+        text,
+        MEASUREMENT_TEXT_SIZE_PX,
+        RulerConfig::angle_text_color(params.dark_mode),
+        Some(RulerConfig::measurement_background_color(params.dark_mode)),
+        measurement.end,
+        0.0,
+        Some(outward),
+        params.total_zoom,
+    )
+}
+
+/// An angle in whole degrees.
+fn degrees_text(deg: f64) -> String {
+    format!("{:.0}°", deg.round())
 }
 
 fn draw_angle_dial(
@@ -377,6 +695,21 @@ fn draw_angle_dial(
     // wiggles the centered position as the zoom changes). We then undo the
     // camera's zoom inside this transform so the local frame is in surface
     // pixels — the text ends up at a stable, constant on-screen position.
+    draw_label(
+        cx,
+        rotation_text(ruler),
+        ANGLE_TEXT_SIZE_PX,
+        RulerConfig::angle_text_color(dark_mode),
+        None,
+        dial_pos_doc,
+        0.0,
+        None,
+        total_zoom,
+    )
+}
+
+/// The angle the ruler is turned by, as shown in the dial.
+fn rotation_text(ruler: &RulerConfig) -> String {
     let normalized_deg = RulerConfig::normalize_angle(ruler.angle).to_degrees();
     // Angles set in the angle row have at most one decimal, while turning the ruler by
     // hand gives arbitrary angles. Show the decimal only for the former. Round first so
@@ -398,22 +731,11 @@ fn draw_angle_dial(
         rounded
     };
     // Whole degrees without decimals, e.g. set in the angle row: 37.5°
-    let text = if display_value.fract() == 0.0 {
+    if display_value.fract() == 0.0 {
         format!("{display_value:.0}°")
     } else {
         format!("{display_value:.1}°")
-    };
-    draw_label(
-        cx,
-        text,
-        ANGLE_TEXT_SIZE_PX,
-        RulerConfig::angle_text_color(dark_mode),
-        None,
-        dial_pos_doc,
-        0.0,
-        None,
-        total_zoom,
-    )
+    }
 }
 
 #[cfg(test)]
@@ -423,7 +745,12 @@ mod tests {
     use crate::pens::pensconfig::rulerconfig::RulerMeasurement;
 
     /// Draw the ruler onto a throwaway surface, to check the geometry it produces stays valid.
-    fn draw_at(total_zoom: f64, angle: f64, metric_scale: bool) -> anyhow::Result<()> {
+    fn draw_at(
+        total_zoom: f64,
+        angle: f64,
+        metric_scale: bool,
+        kind: RulerKind,
+    ) -> anyhow::Result<()> {
         let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 400, 300)?;
         let cairo_cx = cairo::Context::new(&surface)?;
         let mut piet_cx = piet_cairo::CairoRenderContext::new(&cairo_cx);
@@ -433,10 +760,22 @@ mod tests {
             anchor: Vector2::new(200.0, 150.0),
             dial_pos: Vector2::new(200.0, 150.0),
             metric_scale,
+            kind,
             measurement: Some(RulerMeasurement {
                 start: Vector2::new(10.0, 10.0),
                 end: Vector2::new(60.0, 10.0),
-                side: 1.0,
+                target: if kind == RulerKind::Protractor {
+                    SnapTarget::Arc {
+                        center: Vector2::new(200.0, 150.0),
+                        radius: 100.0,
+                    }
+                } else {
+                    SnapTarget::Line {
+                        point: Vector2::new(200.0, 150.0),
+                        dir: Vector2::X,
+                        outward: Vector2::Y,
+                    }
+                },
             }),
             ..RulerConfig::default()
         };
@@ -463,8 +802,15 @@ mod tests {
         for total_zoom in [Camera::ZOOM_MIN, 1.0, Camera::ZOOM_MAX] {
             for angle in [0.0, 0.42, std::f64::consts::FRAC_PI_2, 2.5] {
                 for metric_scale in [true, false] {
-                    draw_at(total_zoom, angle, metric_scale)
-                        .unwrap_or_else(|e| panic!("drawing failed at zoom {total_zoom}: {e:?}"));
+                    for kind in [
+                        RulerKind::Ruler,
+                        RulerKind::SetSquare,
+                        RulerKind::Protractor,
+                    ] {
+                        draw_at(total_zoom, angle, metric_scale, kind).unwrap_or_else(|e| {
+                            panic!("drawing {kind:?} failed at zoom {total_zoom}: {e:?}")
+                        });
+                    }
                 }
             }
         }
@@ -484,6 +830,26 @@ mod tests {
             let (tick, medium, label) = metric_steps_mm(px_per_mm);
             assert_eq!(label % tick, 0);
             assert_eq!(label % 10, 0, "labels are whole centimeters");
+            if let Some(medium) = medium {
+                assert!(tick < medium && medium < label && label % medium == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn degree_steps_stay_readable() {
+        // A protractor with a radius of 220 pixels: every degree, labels every 10°.
+        assert_eq!(
+            degree_steps(220.0 * std::f64::consts::PI / 180.0),
+            (1, Some(5), 10)
+        );
+        // The smaller scale of the set square gets labels every 30°.
+        assert_eq!(degree_steps(1.5), (5, Some(10), 30));
+
+        for px_per_deg in [0.01, 0.2, 0.5, 1.0, 3.0, 20.0] {
+            let (tick, medium, label) = degree_steps(px_per_deg);
+            assert_eq!(180 % label, 0, "both ends are labelled");
+            assert_eq!(label % tick, 0);
             if let Some(medium) = medium {
                 assert!(tick < medium && medium < label && label % medium == 0);
             }
