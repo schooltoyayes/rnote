@@ -910,10 +910,32 @@ mod imp {
                         // All math is in scroller (window-relative) coordinates —
                         // bbcenter is already in that space.
                         ruler_drag.set(None);
-                        let from_touchscreen = gesture
-                            .current_event_device()
-                            .map(|d| d.source() == gdk::InputSource::Touchscreen)
-                            .unwrap_or(false);
+                        // On Windows the event device is not always reported as the
+                        // touchscreen, so touch events count as well. Trackpad pinches come
+                        // as touchpad events instead.
+                        let event_type = gesture.current_event().map(|e| e.event_type());
+                        let device_source = gesture.current_event_device().map(|d| d.source());
+                        let from_touchscreen = device_source == Some(gdk::InputSource::Touchscreen)
+                            || matches!(
+                                event_type,
+                                Some(
+                                    gdk::EventType::TouchBegin
+                                        | gdk::EventType::TouchUpdate
+                                        | gdk::EventType::TouchEnd
+                                )
+                            );
+                        tracing::debug!(
+                            ?event_type,
+                            ?device_source,
+                            points = ?gesture
+                                .sequences()
+                                .iter()
+                                .map(|seq| gesture.point(Some(seq)))
+                                .collect::<Vec<_>>(),
+                            ?bbcenter,
+                            from_touchscreen,
+                            "Two finger gesture begin"
+                        );
                         if from_touchscreen && let Some(bbcenter) = bbcenter {
                             let projected_opt = {
                                 let config = canvas.engine_ref().engine_config().clone();
@@ -941,6 +963,12 @@ mod imp {
                                                 })
                                                 .unwrap_or(false)
                                         });
+                                    tracing::debug!(
+                                        all_on_body,
+                                        anchor = ?ruler.anchor,
+                                        half_w,
+                                        "Two finger gesture on the ruler"
+                                    );
                                     if all_on_body {
                                         // Project centroid onto the ruler centerline.
                                         let rel = bbcenter - ruler.anchor;
