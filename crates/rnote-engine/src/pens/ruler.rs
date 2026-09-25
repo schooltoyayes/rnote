@@ -1,4 +1,5 @@
 // Imports
+use crate::document::format::MeasureUnit;
 use crate::pens::pensconfig::rulerconfig::{RulerConfig, RulerView};
 use p2d::bounding_volume::Aabb;
 use p2d::math::Vector2;
@@ -27,6 +28,107 @@ const DIAL_MAJOR_TICK_EVERY: u32 = 5; // major every 30°
 const INDICATOR_SIZE_PX: f64 = 6.0;
 /// Length of medium tick marks, in surface pixels. Drawn every 5th tick.
 const EDGE_TICK_MEDIUM_LEN_PX: f64 = 10.0;
+/// On the metric scale, ticks closer than this are left out, in surface pixels.
+const METRIC_MIN_TICK_SPACING_PX: f64 = 3.0;
+/// On the metric scale, labels closer than this are left out, in surface pixels.
+const METRIC_MIN_LABEL_SPACING_PX: f64 = 36.0;
+/// Font size of the metric scale labels, in surface pixels.
+const SCALE_LABEL_SIZE_PX: f64 = 11.0;
+/// Font size of the length shown while drawing along the ruler, in surface pixels.
+const MEASUREMENT_TEXT_SIZE_PX: f64 = 13.0;
+/// Distance between the drawn stroke and its length label, in surface pixels.
+const MEASUREMENT_OFFSET_PX: f64 = 10.0;
+
+/// The steps of the metric scale in millimeters for the given on-screen length of a
+/// millimeter: between the ticks, between the medium ticks if there are any, and between the
+/// labelled ticks, which are always whole centimeters.
+fn metric_steps_mm(px_per_mm: f64) -> (i64, Option<i64>, i64) {
+    const STEPS_MM: [i64; 9] = [1, 5, 10, 50, 100, 500, 1000, 5000, 10000];
+    let fits = |step: i64, min_px: f64| step as f64 * px_per_mm >= min_px;
+
+    let tick = STEPS_MM
+        .into_iter()
+        .find(|step| fits(*step, METRIC_MIN_TICK_SPACING_PX))
+        .unwrap_or(STEPS_MM[STEPS_MM.len() - 1]);
+    let label = STEPS_MM
+        .into_iter()
+        .filter(|step| *step >= tick.max(10))
+        .find(|step| fits(*step, METRIC_MIN_LABEL_SPACING_PX))
+        .unwrap_or(STEPS_MM[STEPS_MM.len() - 1]);
+    let medium = STEPS_MM
+        .into_iter()
+        .find(|step| *step > tick)
+        .filter(|step| *step < label && label % step == 0);
+    (tick, medium, label)
+}
+
+/// The angle closest to `angle` that keeps text along it upright on screen.
+fn upright_angle(angle: f64) -> f64 {
+    let angle = angle.rem_euclid(std::f64::consts::TAU);
+    if angle > std::f64::consts::FRAC_PI_2 && angle <= 3.0 * std::f64::consts::FRAC_PI_2 {
+        angle - std::f64::consts::PI
+    } else {
+        angle
+    }
+}
+
+/// Draw text centered at `center`, rotated by `rotation`, with a constant on-screen size.
+///
+/// With `outward` the text is moved in that direction until it is `MEASUREMENT_OFFSET_PX` away
+/// from `center`. With `background` a rounded rectangle is drawn behind it.
+#[allow(clippy::too_many_arguments)]
+fn draw_label(
+    cx: &mut piet_cairo::CairoRenderContext,
+    text: String,
+    size_px: f64,
+    color: piet::Color,
+    background: Option<piet::Color>,
+    center: Vector2,
+    rotation: f64,
+    outward: Option<Vector2>,
+    total_zoom: f64,
+) -> anyhow::Result<()> {
+    // The layout is built at a fixed pixel size, then drawn with the zoom undone, so it does not
+    // wiggle when the zoom changes.
+    let layout = cx
+        .text()
+        .new_text_layout(text)
+        .font(piet::FontFamily::SYSTEM_UI, size_px)
+        .text_color(color)
+        .build()
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let size = layout.size();
+    let center = match outward {
+        Some(dir) => {
+            let half_extent = size.width * 0.5 * dir.x.abs() + size.height * 0.5 * dir.y.abs();
+            center + dir * (MEASUREMENT_OFFSET_PX + half_extent) / total_zoom
+        }
+        None => center,
+    };
+
+    cx.save().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    cx.transform(
+        kurbo::Affine::translate(center.to_kurbo_vec())
+            * kurbo::Affine::rotate(rotation)
+            * kurbo::Affine::scale(1.0 / total_zoom),
+    );
+    if let Some(background) = background {
+        let pad = size_px * 0.35;
+        let rect = kurbo::Rect::new(
+            -size.width * 0.5 - pad,
+            -size.height * 0.5 - pad * 0.5,
+            size.width * 0.5 + pad,
+            size.height * 0.5 + pad * 0.5,
+        );
+        cx.fill(rect.to_rounded_rect(pad), &background);
+    }
+    cx.draw_text(
+        &layout,
+        kurbo::Point::new(-size.width * 0.5, -size.height * 0.5),
+    );
+    cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    Ok(())
+}
 
 /// Compute the document-space `[min_t, max_t]` parameter range along the ruler
 /// direction so that the segment `anchor_doc + t * direction` covers the full
@@ -64,12 +166,15 @@ fn viewport_t_range(
 /// `visible_doc` is the whole area visible on screen in document coordinates,
 /// which in the bounded layouts extends past the document itself. The ruler
 /// spans all of it, so it is not cut off outside the page.
+///
+/// `doc_dpi` is the resolution of the document, used for the metric scale.
 pub fn draw_ruler_on_doc(
     cx: &mut piet_cairo::CairoRenderContext,
     ruler: &RulerConfig,
     visible_doc: Aabb,
     view: RulerView,
     background_color: &rnote_compose::Color,
+    doc_dpi: f64,
 ) -> anyhow::Result<()> {
     if !ruler.visible {
         return Ok(());
@@ -107,10 +212,21 @@ pub fn draw_ruler_on_doc(
         1.0 / total_zoom,
     );
 
-    // Tick marks on the long edges, three-tier (minor / medium / major).
-    // Spacing is fixed in surface pixels — the ruler's scale is independent
-    // of the document grid.
-    let spacing = ruler.tick_spacing / total_zoom;
+    // Tick marks on the long edges, three-tier (minor / medium / major). On the
+    // metric scale they are millimeters and centimeters of the document with zero
+    // at the anchor, otherwise they have a fixed spacing in surface pixels and
+    // are independent of the document.
+    let mm_doc = doc_dpi / MeasureUnit::AMOUNT_MM_IN_INCH;
+    let (tick_step, medium_step, major_step) = if ruler.metric_scale {
+        metric_steps_mm(mm_doc * total_zoom)
+    } else {
+        (1, Some(5), 10)
+    };
+    let spacing = if ruler.metric_scale {
+        tick_step as f64 * mm_doc
+    } else {
+        ruler.tick_spacing / total_zoom
+    };
     let tick_major = RulerConfig::TICK_MAJOR_LEN_PX / total_zoom;
     let tick_medium = EDGE_TICK_MEDIUM_LEN_PX / total_zoom;
     let tick_minor = RulerConfig::TICK_MINOR_LEN_PX / total_zoom;
@@ -122,12 +238,19 @@ pub fn draw_ruler_on_doc(
         cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
         return Ok(());
     }
+    // Positions along the ruler and values of the labelled ticks.
+    let mut labels = Vec::new();
     for i in i_min..=i_max {
         let t = i as f64 * spacing;
         let p = anchor_doc + t * dir;
-        let len = if i.rem_euclid(10) == 0 {
+        let value = i * tick_step;
+        let len = if value.rem_euclid(major_step) == 0 {
+            if ruler.metric_scale {
+                // Whole centimeters.
+                labels.push((p, value.abs() / 10));
+            }
             tick_major
-        } else if i.rem_euclid(5) == 0 {
+        } else if medium_step.is_some_and(|step| value.rem_euclid(step) == 0) {
             tick_medium
         } else {
             tick_minor
@@ -146,6 +269,42 @@ pub fn draw_ruler_on_doc(
             &RulerConfig::tick_color(dark_mode),
             tick_w,
         );
+    }
+
+    // The labels sit inside the body next to the major ticks of both edges.
+    let label_rotation = upright_angle(ruler.angle);
+    let label_inset = (RulerConfig::TICK_MAJOR_LEN_PX + SCALE_LABEL_SIZE_PX * 0.9) / total_zoom;
+    for (p, value) in labels {
+        for side in [1.0, -1.0] {
+            draw_label(
+                cx,
+                value.to_string(),
+                SCALE_LABEL_SIZE_PX,
+                RulerConfig::tick_color(dark_mode),
+                None,
+                p + side * (half_w - label_inset) * normal,
+                label_rotation,
+                None,
+                total_zoom,
+            )?;
+        }
+    }
+
+    // The length of the stroke that is drawn along the ruler, next to its end
+    // and outside the ruler.
+    if let Some(measurement) = ruler.measurement {
+        let length_cm = (measurement.end - measurement.start).length() / mm_doc / 10.0;
+        draw_label(
+            cx,
+            format!("{length_cm:.1} cm"),
+            MEASUREMENT_TEXT_SIZE_PX,
+            RulerConfig::angle_text_color(dark_mode),
+            Some(RulerConfig::measurement_background_color(dark_mode)),
+            measurement.end,
+            0.0,
+            Some(measurement.side * normal),
+            total_zoom,
+        )?;
     }
 
     if ruler.show_dial {
@@ -219,9 +378,16 @@ fn draw_angle_dial(
     // camera's zoom inside this transform so the local frame is in surface
     // pixels — the text ends up at a stable, constant on-screen position.
     let normalized_deg = RulerConfig::normalize_angle(ruler.angle).to_degrees();
-    // Round first so `-0.3°` doesn't surface as `-0°`; then canonicalize the
-    // sign so `format!` doesn't print the negative zero.
-    let rounded = normalized_deg.round();
+    // Angles set in the angle row have at most one decimal, while turning the ruler by
+    // hand gives arbitrary angles. Show the decimal only for the former. Round first so
+    // `-0.3°` doesn't surface as `-0°`; then canonicalize the sign so `format!` doesn't
+    // print the negative zero.
+    let tenths = (normalized_deg * 10.0).round();
+    let rounded = if (normalized_deg * 10.0 - tenths).abs() < 1e-3 {
+        tenths / 10.0
+    } else {
+        normalized_deg.round()
+    };
     // Canonicalize: the displayed range is (-90°, 90°], so a rounded -90° is
     // the same orientation as +90° — show +90°. Also avoid printing "-0°".
     let display_value = if rounded == -90.0 {
@@ -231,34 +397,33 @@ fn draw_angle_dial(
     } else {
         rounded
     };
-    let text = format!("{display_value:.0}°");
-    let layout = cx
-        .text()
-        .new_text_layout(text)
-        .font(piet::FontFamily::SYSTEM_UI, ANGLE_TEXT_SIZE_PX)
-        .text_color(RulerConfig::angle_text_color(dark_mode))
-        .build()
-        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    let text_size = layout.size();
-    cx.save().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-    cx.transform(kurbo::Affine::translate(dial_pos_doc.to_kurbo_vec()));
-    cx.transform(kurbo::Affine::scale(1.0 / total_zoom));
-    cx.draw_text(
-        &layout,
-        kurbo::Point::new(-text_size.width * 0.5, -text_size.height * 0.5),
-    );
-    cx.restore().map_err(|e| anyhow::anyhow!("{e:?}"))?;
-
-    Ok(())
+    // Whole degrees without decimals, e.g. set in the angle row: 37.5°
+    let text = if display_value.fract() == 0.0 {
+        format!("{display_value:.0}°")
+    } else {
+        format!("{display_value:.1}°")
+    };
+    draw_label(
+        cx,
+        text,
+        ANGLE_TEXT_SIZE_PX,
+        RulerConfig::angle_text_color(dark_mode),
+        None,
+        dial_pos_doc,
+        0.0,
+        None,
+        total_zoom,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::Camera;
+    use crate::pens::pensconfig::rulerconfig::RulerMeasurement;
 
     /// Draw the ruler onto a throwaway surface, to check the geometry it produces stays valid.
-    fn draw_at(total_zoom: f64, angle: f64) -> anyhow::Result<()> {
+    fn draw_at(total_zoom: f64, angle: f64, metric_scale: bool) -> anyhow::Result<()> {
         let surface = cairo::ImageSurface::create(cairo::Format::ARgb32, 400, 300)?;
         let cairo_cx = cairo::Context::new(&surface)?;
         let mut piet_cx = piet_cairo::CairoRenderContext::new(&cairo_cx);
@@ -267,6 +432,12 @@ mod tests {
             angle,
             anchor: Vector2::new(200.0, 150.0),
             dial_pos: Vector2::new(200.0, 150.0),
+            metric_scale,
+            measurement: Some(RulerMeasurement {
+                start: Vector2::new(10.0, 10.0),
+                end: Vector2::new(60.0, 10.0),
+                side: 1.0,
+            }),
             ..RulerConfig::default()
         };
         let visible_doc = Aabb::new(
@@ -283,16 +454,50 @@ mod tests {
             visible_doc,
             RulerView::from_camera(&camera),
             &rnote_compose::Color::WHITE,
+            96.0,
         )
     }
 
     #[test]
     fn draws_across_the_zoom_range() {
         for total_zoom in [Camera::ZOOM_MIN, 1.0, Camera::ZOOM_MAX] {
-            for angle in [0.0, 0.42, std::f64::consts::FRAC_PI_2] {
-                draw_at(total_zoom, angle)
-                    .unwrap_or_else(|e| panic!("drawing failed at zoom {total_zoom}: {e:?}"));
+            for angle in [0.0, 0.42, std::f64::consts::FRAC_PI_2, 2.5] {
+                for metric_scale in [true, false] {
+                    draw_at(total_zoom, angle, metric_scale)
+                        .unwrap_or_else(|e| panic!("drawing failed at zoom {total_zoom}: {e:?}"));
+                }
             }
+        }
+    }
+
+    #[test]
+    fn metric_steps_stay_readable() {
+        // Zoomed in: millimeters, half centimeters in between and every centimeter labelled.
+        assert_eq!(metric_steps_mm(4.0), (1, Some(5), 10));
+        // Around 100% at 96 dpi a millimeter is 3.78 pixels.
+        assert_eq!(metric_steps_mm(96.0 / 25.4), (1, Some(5), 10));
+        // Zoomed out, the ticks and labels get further apart.
+        assert_eq!(metric_steps_mm(1.0), (5, Some(10), 50));
+        assert_eq!(metric_steps_mm(0.1), (50, Some(100), 500));
+
+        for px_per_mm in [0.001, 0.05, 0.3, 2.0, 10.0, 100.0] {
+            let (tick, medium, label) = metric_steps_mm(px_per_mm);
+            assert_eq!(label % tick, 0);
+            assert_eq!(label % 10, 0, "labels are whole centimeters");
+            if let Some(medium) = medium {
+                assert!(tick < medium && medium < label && label % medium == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn upright_angle_keeps_text_readable() {
+        use std::f64::consts::PI;
+        for angle in [0.0, 0.5, 1.5, 2.0, PI, 4.0, 5.0, -0.5, -2.0, 7.0] {
+            let upright = upright_angle(angle);
+            assert!(upright.cos() >= -1e-9, "{angle} -> {upright}");
+            // Still along the same line.
+            assert!((upright - angle).sin().abs() < 1e-9);
         }
     }
 }

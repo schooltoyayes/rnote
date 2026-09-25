@@ -2,7 +2,7 @@
 use super::PenBehaviour;
 use super::PenStyle;
 use super::pensconfig::brushconfig::BrushStyle;
-use super::pensconfig::rulerconfig::RulerView;
+use super::pensconfig::rulerconfig::{RulerMeasurement, RulerView};
 use crate::engine::{EngineView, EngineViewMut};
 use crate::store::StrokeKey;
 use crate::strokes::BrushStroke;
@@ -161,6 +161,18 @@ impl PenBehaviour for Brush {
                         engine_view.camera.image_scale(),
                     );
 
+                    // Show the length of strokes drawn along the ruler.
+                    engine_view
+                        .config
+                        .pens_config
+                        .brush_config
+                        .ruler_config
+                        .measurement = ruler_snap_side.map(|side| RulerMeasurement {
+                        start: element.pos,
+                        end: element.pos,
+                        side,
+                    });
+
                     self.state = BrushState::Drawing {
                         path_builder: new_builder(
                             engine_view.config.pens_config.brush_config.builder_type,
@@ -254,6 +266,12 @@ impl PenBehaviour for Brush {
                     .document
                     .resize_autoexpand(engine_view.store, engine_view.camera);
 
+                engine_view
+                    .config
+                    .pens_config
+                    .brush_config
+                    .ruler_config
+                    .measurement = None;
                 self.state = BrushState::Idle;
 
                 widget_flags |= engine_view.store.record(Instant::now());
@@ -281,12 +299,13 @@ impl PenBehaviour for Brush {
                 if let Some(side) = *ruler_snap_side {
                     match &mut pen_event {
                         PenEvent::Down { element, .. } | PenEvent::Up { element, .. } => {
-                            element.pos = engine_view
-                                .config
-                                .pens_config
-                                .brush_config
-                                .ruler_config
-                                .project_to_edge(element.pos, side, ruler_view);
+                            let ruler_config =
+                                &mut engine_view.config.pens_config.brush_config.ruler_config;
+                            element.pos =
+                                ruler_config.project_to_edge(element.pos, side, ruler_view);
+                            if let Some(measurement) = &mut ruler_config.measurement {
+                                measurement.end = element.pos;
+                            }
                         }
                         _ => {}
                     }
@@ -384,6 +403,12 @@ impl PenBehaviour for Brush {
                             .document
                             .resize_autoexpand(engine_view.store, engine_view.camera);
 
+                        engine_view
+                            .config
+                            .pens_config
+                            .brush_config
+                            .ruler_config
+                            .measurement = None;
                         self.state = BrushState::Idle;
 
                         widget_flags |= engine_view.store.record(Instant::now());

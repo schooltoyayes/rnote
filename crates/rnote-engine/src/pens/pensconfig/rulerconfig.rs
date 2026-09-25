@@ -86,6 +86,21 @@ pub struct RulerConfig {
     pub body_opacity: f64,
     /// Degrees of ruler rotation per scroll-wheel unit (`dy`). Persisted.
     pub scroll_rotation_step_deg: f64,
+    /// Whether the tick marks show millimeters and centimeters of the document, with zero at
+    /// the anchor. Otherwise they are spaced `tick_spacing` apart on screen. Persisted.
+    pub metric_scale: bool,
+    /// The stroke that is currently drawn along the ruler, to show its length. In-session only.
+    #[serde(skip)]
+    pub measurement: Option<RulerMeasurement>,
+}
+
+/// A stroke drawn along the ruler, in document coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct RulerMeasurement {
+    pub start: Vector2,
+    pub end: Vector2,
+    /// The edge the stroke is drawn along, see [`RulerConfig::snap_side`].
+    pub side: f64,
 }
 
 impl Default for RulerConfig {
@@ -102,6 +117,8 @@ impl Default for RulerConfig {
             tick_spacing: Self::TICK_SPACING_DEFAULT,
             body_opacity: Self::BODY_OPACITY_DEFAULT,
             scroll_rotation_step_deg: Self::SCROLL_ROTATION_STEP_DEG_DEFAULT,
+            metric_scale: true,
+            measurement: None,
         }
     }
 }
@@ -209,6 +226,15 @@ impl RulerConfig {
             piet::Color::rgba8(255, 255, 255, 255)
         } else {
             piet::Color::rgba8(0, 0, 0, 255)
+        }
+    }
+
+    /// Background behind the length shown while drawing along the ruler.
+    pub fn measurement_background_color(dark_mode: bool) -> piet::Color {
+        if dark_mode {
+            piet::Color::rgba8(40, 40, 40, 230)
+        } else {
+            piet::Color::rgba8(255, 255, 255, 230)
         }
     }
 

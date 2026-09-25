@@ -137,6 +137,12 @@
                 </object>
               </child>
               <child>
+                <object class="AdwSwitchRow" id="ruler_metric_scale_row">
+                  <property name="title" translatable="yes">Centimeter Scale</property>
+                  <property name="subtitle" translatable="yes">Tick marks in millimeters and centimeters of the page, starting at zero where the ruler was placed. Shows the length while drawing along the ruler.</property>
+                </object>
+              </child>
+              <child>
                 <object class="AdwSwitchRow" id="ruler_angle_snap_row">
                   <property name="title" translatable="yes">Snap to Common Angles</property>
                   <property name="subtitle" translatable="yes">When rotating with two fingers, snap to 0°, ±45° and ±90°. Scroll rotation is never snapped.</property>

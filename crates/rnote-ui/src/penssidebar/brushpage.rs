@@ -68,6 +68,8 @@ mod imp {
         /// Set while the angle row gets synced to the ruler, so the sync does not rotate it.
         pub(crate) ruler_angle_syncing: Cell<bool>,
         #[template_child]
+        pub(crate) ruler_metric_scale_row: TemplateChild<adw::SwitchRow>,
+        #[template_child]
         pub(crate) ruler_snap_distance_row: TemplateChild<adw::SpinRow>,
         #[template_child]
         pub(crate) ruler_angle_snap_row: TemplateChild<adw::SwitchRow>,
@@ -549,6 +551,32 @@ impl RnBrushPage {
             }
         ));
 
+        imp.ruler_metric_scale_row
+            .get()
+            .connect_active_notify(clone!(
+                #[weak(rename_to=brushpage)]
+                self,
+                #[weak]
+                appwindow,
+                move |row| {
+                    appwindow
+                        .engine_config()
+                        .write()
+                        .pens_config
+                        .brush_config
+                        .ruler_config
+                        .metric_scale = row.is_active();
+                    // The tick spacing only applies without the centimeter scale.
+                    brushpage
+                        .imp()
+                        .ruler_tick_spacing_row
+                        .set_sensitive(!row.is_active());
+                    if let Some(canvas) = appwindow.active_tab_canvas() {
+                        canvas.queue_draw();
+                    }
+                }
+            ));
+
         imp.ruler_angle_snap_row.get().connect_active_notify(clone!(
             #[weak]
             appwindow,
@@ -681,6 +709,10 @@ impl RnBrushPage {
 
         imp.ruler_toggle
             .set_active(brush_config.ruler_config.visible);
+        imp.ruler_metric_scale_row
+            .set_active(brush_config.ruler_config.metric_scale);
+        imp.ruler_tick_spacing_row
+            .set_sensitive(!brush_config.ruler_config.metric_scale);
         imp.ruler_snap_distance_row
             .set_value(brush_config.ruler_config.snap_distance);
         imp.ruler_angle_snap_row

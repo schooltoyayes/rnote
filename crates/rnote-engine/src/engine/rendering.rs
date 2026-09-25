@@ -221,6 +221,7 @@ impl Engine {
                 visible_doc,
                 crate::pens::pensconfig::rulerconfig::RulerView::from_camera(&self.camera),
                 &self.document.config.background.color,
+                self.document.config.format.dpi(),
             )?;
             snapshot.restore();
         }
