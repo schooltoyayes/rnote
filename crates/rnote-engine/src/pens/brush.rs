@@ -3,10 +3,12 @@ use super::PenBehaviour;
 use super::PenStyle;
 use super::pensconfig::brushconfig::BrushStyle;
 use super::pensconfig::rulerconfig::{RulerMeasurement, RulerView, SnapTarget};
-use crate::engine::{EngineView, EngineViewMut};
+use super::shaperecognition;
+use crate::engine::{EngineTask, EngineTaskSender, EngineView, EngineViewMut};
 use crate::store::StrokeKey;
-use crate::strokes::BrushStroke;
 use crate::strokes::Stroke;
+use crate::strokes::{BrushStroke, ShapeStroke};
+use crate::tasks::OneOffTaskHandle;
 use crate::{DrawableOnDoc, WidgetFlags};
 use p2d::bounding_volume::{Aabb, BoundingVolume};
 use p2d::math::Vector2;
@@ -20,9 +22,10 @@ use rnote_compose::builders::{
 use rnote_compose::eventresult::{EventPropagation, EventResult};
 use rnote_compose::penevent::{PenEvent, PenProgress};
 use rnote_compose::penpath::{Element, Segment};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 enum BrushState {
     Idle,
     Drawing {
@@ -34,6 +37,15 @@ enum BrushState {
         /// of the stroke. `None` means the stroke started unsnapped and will
         /// never snap.
         ruler_snap: Option<SnapTarget>,
+        /// Fires when the pen is held still, to recognize a shape in the stroke. `None` if
+        /// shape recognition is off or the stroke snapped to the ruler.
+        hold_task: Option<OneOffTaskHandle>,
+        /// Where the pen was when it last moved noticeably, in document coordinates.
+        hold_pos: Vector2,
+    },
+    /// The stroke was replaced by a recognized shape, waiting for the pen to be lifted.
+    Recognized {
+        shape_key: StrokeKey,
     },
     DraggingRuler {
         anchor_begin: Vector2,
@@ -178,6 +190,15 @@ impl PenBehaviour for Brush {
                         target,
                     });
 
+                    // Strokes along the ruler are straight already.
+                    let hold_task = (engine_view
+                        .config
+                        .pens_config
+                        .brush_config
+                        .shape_recognition
+                        && ruler_snap.is_none())
+                    .then(|| Self::new_hold_task(engine_view.tasks_tx.clone()));
+
                     self.state = BrushState::Drawing {
                         path_builder: new_builder(
                             engine_view.config.pens_config.brush_config.builder_type,
@@ -187,6 +208,8 @@ impl PenBehaviour for Brush {
                         current_stroke_key,
                         preview_style,
                         ruler_snap,
+                        hold_task,
+                        hold_pos: element.pos,
                     };
 
                     EventResult {
@@ -260,6 +283,39 @@ impl PenBehaviour for Brush {
                     progress: PenProgress::InProgress,
                 }
             }
+            (BrushState::Recognized { .. }, PenEvent::Down { .. }) => EventResult {
+                handled: true,
+                propagate: EventPropagation::Stop,
+                progress: PenProgress::InProgress,
+            },
+            (BrushState::Recognized { shape_key }, PenEvent::Up { .. } | PenEvent::Cancel) => {
+                engine_view.store.update_geometry_for_stroke(*shape_key);
+                engine_view.store.regenerate_rendering_for_stroke_threaded(
+                    engine_view.tasks_tx.clone(),
+                    *shape_key,
+                    engine_view.camera.viewport(),
+                    engine_view.camera.image_scale(),
+                );
+                widget_flags |= engine_view
+                    .document
+                    .resize_autoexpand(engine_view.store, engine_view.camera);
+
+                self.state = BrushState::Idle;
+
+                widget_flags |= engine_view.store.record(Instant::now());
+                widget_flags.store_modified = true;
+
+                EventResult {
+                    handled: true,
+                    propagate: EventPropagation::Stop,
+                    progress: PenProgress::Finished,
+                }
+            }
+            (BrushState::Recognized { .. }, _) => EventResult {
+                handled: false,
+                propagate: EventPropagation::Proceed,
+                progress: PenProgress::InProgress,
+            },
             (
                 BrushState::Drawing {
                     current_stroke_key, ..
@@ -312,10 +368,22 @@ impl PenBehaviour for Brush {
                     path_builder,
                     current_stroke_key,
                     ruler_snap,
+                    hold_task,
+                    hold_pos,
                     ..
                 },
                 mut pen_event,
             ) => {
+                // Wait for the pen to be held still again whenever it moves noticeably.
+                if let (Some(task), PenEvent::Down { element, .. }) = (hold_task, &pen_event)
+                    && (element.pos - *hold_pos).length() > Self::HOLD_TOLERANCE_PX / total_zoom
+                {
+                    *hold_pos = element.pos;
+                    if task.reset_timeout().is_err() {
+                        // It fired already, without a shape to recognize.
+                        *task = Self::new_hold_task(engine_view.tasks_tx.clone());
+                    }
+                }
                 // If the stroke started snapped, every subsequent point is
                 // projected onto the same edge — the stroke stays on the
                 // ruler until release, regardless of how far the input moves
@@ -464,7 +532,9 @@ impl DrawableOnDoc for Brush {
 
         match &self.state {
             BrushState::Idle => None,
-            BrushState::DraggingRuler { .. } | BrushState::DraggingProtractorArm { .. } => None,
+            BrushState::DraggingRuler { .. }
+            | BrushState::DraggingProtractorArm { .. }
+            | BrushState::Recognized { .. } => None,
             BrushState::Drawing { path_builder, .. } => {
                 path_builder.bounds(&style, engine_view.camera.zoom())
             }
@@ -481,7 +551,8 @@ impl DrawableOnDoc for Brush {
         match &self.state {
             BrushState::Idle
             | BrushState::DraggingRuler { .. }
-            | BrushState::DraggingProtractorArm { .. } => {}
+            | BrushState::DraggingProtractorArm { .. }
+            | BrushState::Recognized { .. } => {}
             BrushState::Drawing {
                 path_builder,
                 preview_style,
@@ -509,6 +580,64 @@ impl DrawableOnDoc for Brush {
 
 impl Brush {
     const INPUT_OVERSHOOT: f64 = 30.0;
+    /// How long the pen has to be held still to recognize a shape.
+    const HOLD_DURATION: Duration = Duration::from_millis(500);
+    /// Movements below this don't count when holding the pen still, in surface pixels.
+    const HOLD_TOLERANCE_PX: f64 = 4.0;
+
+    fn new_hold_task(tasks_tx: EngineTaskSender) -> OneOffTaskHandle {
+        OneOffTaskHandle::new(
+            move || tasks_tx.send(EngineTask::BrushHold),
+            Self::HOLD_DURATION,
+        )
+    }
+
+    /// The pen was held still while drawing: recognize a shape in the stroke drawn so far, and
+    /// if there is one, replace the stroke with it.
+    pub(crate) fn handle_hold(&mut self, engine_view: &mut EngineViewMut) -> WidgetFlags {
+        let mut widget_flags = WidgetFlags::default();
+        let BrushState::Drawing {
+            current_stroke_key,
+            hold_task: Some(_),
+            hold_pos,
+            ..
+        } = &self.state
+        else {
+            return widget_flags;
+        };
+        let Some(Stroke::BrushStroke(brushstroke)) =
+            engine_view.store.get_stroke_ref(*current_stroke_key)
+        else {
+            return widget_flags;
+        };
+        // The builder may not have passed on the last points to the stroke yet, the pen is
+        // still where it was held.
+        let points = std::iter::once(brushstroke.path.start.pos)
+            .chain(brushstroke.path.segments.iter().map(|s| s.end().pos))
+            .chain(std::iter::once(*hold_pos))
+            .collect::<Vec<Vector2>>();
+        let Some(shape) = shaperecognition::recognize(&points) else {
+            return widget_flags;
+        };
+
+        let brush_config = &engine_view.config.pens_config.brush_config;
+        let shapestroke = ShapeStroke::new(shape, brush_config.shape_style_for_current_options());
+        let layer = brush_config.layer_for_current_options();
+        engine_view.store.remove_stroke(*current_stroke_key);
+        let shape_key = engine_view
+            .store
+            .insert_stroke(Stroke::ShapeStroke(shapestroke), Some(layer));
+        engine_view.store.regenerate_rendering_for_stroke(
+            shape_key,
+            engine_view.camera.viewport(),
+            engine_view.camera.image_scale(),
+        );
+        self.state = BrushState::Recognized { shape_key };
+
+        widget_flags.redraw = true;
+        widget_flags.store_modified = true;
+        widget_flags
+    }
 
     fn get_preview_style(engine_view: &EngineView) -> Style {
         let mut style = engine_view
@@ -549,5 +678,114 @@ fn new_builder(
         PenPathBuilderType::Simple => Box::new(PenPathSimpleBuilder::start(element, now)),
         PenPathBuilderType::Curved => Box::new(PenPathCurvedBuilder::start(element, now)),
         PenPathBuilderType::Modeled => Box::new(PenPathModeledBuilder::start(element, now)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Engine;
+    use crate::engine::EngineTask;
+    use crate::pens::PenStyle;
+    use crate::strokes::Stroke;
+    use p2d::math::Vector2;
+    use rnote_compose::penevent::PenEvent;
+    use rnote_compose::penpath::Element;
+    use rnote_compose::shapes::Shape;
+    use std::collections::HashSet;
+    use std::time::{Duration, Instant};
+
+    /// Draw a slightly wobbly, almost closed circle. Returns where the pen stopped.
+    fn draw_circle(engine: &mut Engine, start: Instant) -> Vector2 {
+        let center = Vector2::new(300.0, 300.0);
+        let mut pos = center;
+        for i in 0..=60u64 {
+            let t = std::f64::consts::TAU * 0.97 * i as f64 / 60.0;
+            let wobble = Vector2::new((i as f64 * 1.7).sin(), (i as f64 * 2.3).cos()) * 2.0;
+            pos = center + Vector2::new(t.cos(), t.sin()) * 100.0 + wobble;
+            let _ = engine.handle_pen_event(
+                PenEvent::Down {
+                    element: Element::new(pos, 0.5),
+                    modifier_keys: HashSet::new(),
+                },
+                None,
+                start + Duration::from_millis(i * 10),
+            );
+        }
+        pos
+    }
+
+    fn lift_pen(engine: &mut Engine, pos: Vector2, now: Instant) {
+        let _ = engine.handle_pen_event(
+            PenEvent::Up {
+                element: Element::new(pos, 0.5),
+                modifier_keys: HashSet::new(),
+            },
+            None,
+            now,
+        );
+    }
+
+    fn only_stroke(engine: &Engine) -> Stroke {
+        let keys = engine.store.keys_sorted_chrono();
+        assert_eq!(keys.len(), 1, "expected exactly one stroke");
+        engine.store.get_stroke_ref(keys[0]).unwrap().clone()
+    }
+
+    #[test]
+    fn holding_the_pen_turns_the_stroke_into_a_shape() {
+        let mut engine = Engine::default();
+        let _ = engine.change_pen_style(PenStyle::Brush);
+        let start = Instant::now();
+
+        let pos = draw_circle(&mut engine, start);
+        // The pen is held still until the hold task fires.
+        let _ = engine.handle_engine_task(EngineTask::BrushHold);
+        lift_pen(&mut engine, pos, start + Duration::from_secs(2));
+
+        let Stroke::ShapeStroke(shapestroke) = only_stroke(&engine) else {
+            panic!("the stroke was not replaced by a shape");
+        };
+        let Shape::Ellipse(ellipse) = shapestroke.shape else {
+            panic!("not a circle: {:?}", shapestroke.shape);
+        };
+        assert!((ellipse.radii.x - 100.0).abs() < 8.0, "{ellipse:?}");
+        assert_eq!(ellipse.radii.x, ellipse.radii.y);
+    }
+
+    #[test]
+    fn the_hold_task_fires_after_holding_still() {
+        use futures::FutureExt;
+
+        let mut engine = Engine::default();
+        let mut tasks_rx = engine.take_engine_tasks_rx().unwrap();
+        let _ = engine.change_pen_style(PenStyle::Brush);
+        let start = Instant::now();
+
+        let pos = draw_circle(&mut engine, start);
+        std::thread::sleep(Duration::from_millis(800));
+        // Handle the tasks that arrived in the meantime, like the app does.
+        let mut got_hold = false;
+        while let Some(Some(task)) = tasks_rx.recv().now_or_never() {
+            got_hold |= matches!(task, EngineTask::BrushHold);
+            let _ = engine.handle_engine_task(task);
+        }
+        assert!(got_hold, "the hold task did not fire");
+        lift_pen(&mut engine, pos, Instant::now());
+
+        assert!(matches!(only_stroke(&engine), Stroke::ShapeStroke(_)));
+    }
+
+    #[test]
+    fn without_holding_the_stroke_stays() {
+        let mut engine = Engine::default();
+        let _ = engine.change_pen_style(PenStyle::Brush);
+        let start = Instant::now();
+
+        let pos = draw_circle(&mut engine, start);
+        lift_pen(&mut engine, pos, start + Duration::from_secs(1));
+        // A hold that arrives too late changes nothing.
+        let _ = engine.handle_engine_task(EngineTask::BrushHold);
+
+        assert!(matches!(only_stroke(&engine), Stroke::BrushStroke(_)));
     }
 }

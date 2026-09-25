@@ -427,6 +427,17 @@ Results in the best looking handwriting.</property>
             </object>
           </child>
           <child>
+            <object class="AdwPreferencesGroup">
+              <property name="title" translatable="yes">Shapes</property>
+              <child>
+                <object class="AdwSwitchRow" id="brush_shape_recognition_row">
+                  <property name="title" translatable="yes">Shape Recognition</property>
+                  <property name="subtitle" translatable="yes">Hold the pen still at the end of a stroke to turn it into a clean line, circle, ellipse, triangle, rectangle or polygon</property>
+                </object>
+              </child>
+            </object>
+          </child>
+          <child>
             <!-- Solid options -->
             <object class="AdwPreferencesGroup">
               <property name="title" translatable="yes">Solid Style</property>

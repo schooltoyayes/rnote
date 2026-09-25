@@ -47,6 +47,7 @@ rnote_engine_sources = files(
     'pens/selector/mod.rs',
     'pens/selector/penevents.rs',
     'pens/shaper.rs',
+    'pens/shaperecognition.rs',
     'pens/shortcuts.rs',
     'pens/tools/laser.rs',
     'pens/tools/mod.rs',

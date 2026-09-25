@@ -57,6 +57,8 @@ mod imp {
         #[template_child]
         pub(crate) stroke_width_picker: TemplateChild<RnStrokeWidthPicker>,
         #[template_child]
+        pub(crate) brush_shape_recognition_row: TemplateChild<adw::SwitchRow>,
+        #[template_child]
         pub(crate) ruler_toggle: TemplateChild<ToggleButton>,
         #[template_child]
         pub(crate) set_square_toggle: TemplateChild<ToggleButton>,
@@ -464,6 +466,21 @@ impl RnBrushPage {
                 }
             ));
 
+        imp.brush_shape_recognition_row
+            .get()
+            .connect_active_notify(clone!(
+                #[weak]
+                appwindow,
+                move |row| {
+                    appwindow
+                        .engine_config()
+                        .write()
+                        .pens_config
+                        .brush_config
+                        .shape_recognition = row.is_active();
+                }
+            ));
+
         // Ruler toggles: show the ruler, the set square or the protractor, only one of them at
         // a time, or hide them. The first time one is shown, seed its position to the current
         // viewport center.
@@ -736,6 +753,8 @@ impl RnBrushPage {
             }
         }
 
+        imp.brush_shape_recognition_row
+            .set_active(brush_config.shape_recognition);
         self.sync_ruler_toggles(
             brush_config.ruler_config.visible,
             brush_config.ruler_config.kind,

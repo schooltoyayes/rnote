@@ -98,7 +98,7 @@ impl std::ops::DerefMut for SolidOptions {
     }
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, rename = "brush_config")]
 pub struct BrushConfig {
     #[serde(rename = "builder_type")]
@@ -113,6 +113,23 @@ pub struct BrushConfig {
     pub textured_options: TexturedOptions,
     #[serde(rename = "ruler_config")]
     pub ruler_config: RulerConfig,
+    /// Whether holding the pen still at the end of a stroke turns it into a clean shape.
+    #[serde(rename = "shape_recognition")]
+    pub shape_recognition: bool,
+}
+
+impl Default for BrushConfig {
+    fn default() -> Self {
+        Self {
+            builder_type: PenPathBuilderType::default(),
+            style: BrushStyle::default(),
+            marker_options: MarkerOptions::default(),
+            solid_options: SolidOptions::default(),
+            textured_options: TexturedOptions::default(),
+            ruler_config: RulerConfig::default(),
+            shape_recognition: true,
+        }
+    }
 }
 
 impl BrushConfig {
@@ -149,6 +166,19 @@ impl BrushConfig {
 
                 Style::Textured(options)
             }
+        }
+    }
+
+    /// The style for shapes recognized in strokes. Shapes can't be textured, so those get a
+    /// smooth style with the same width and color.
+    pub(crate) fn shape_style_for_current_options(&self) -> Style {
+        match self.style_for_current_options() {
+            Style::Textured(textured) => Style::Smooth(SmoothOptions {
+                stroke_width: textured.stroke_width,
+                stroke_color: textured.stroke_color,
+                ..SmoothOptions::default()
+            }),
+            style => style,
         }
     }
 }
