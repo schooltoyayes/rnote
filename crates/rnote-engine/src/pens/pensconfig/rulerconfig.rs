@@ -230,6 +230,10 @@ impl RulerConfig {
     pub const PROTRACTOR_HANDLE_OFFSET_PX: f64 = 30.0;
     /// Radius of the arm handles, in surface pixels.
     pub const PROTRACTOR_HANDLE_RADIUS_PX: f64 = 12.0;
+    /// Radius around the arm handles in which touch input grabs them, in surface pixels.
+    pub const PROTRACTOR_TOUCH_HANDLE_RADIUS_PX: f64 = 30.0;
+    /// Distance from the arms in which touch input grabs them, in surface pixels.
+    pub const PROTRACTOR_TOUCH_ARM_DISTANCE_PX: f64 = 18.0;
     /// Length of major tick marks in surface pixels.
     pub const TICK_MAJOR_LEN_PX: f64 = 14.0;
     /// Length of minor tick marks in surface pixels.
@@ -368,6 +372,33 @@ impl RulerConfig {
         self.anchor
             + (self.tool_size + Self::PROTRACTOR_HANDLE_OFFSET_PX)
                 * self.protractor_arm_direction(self.protractor_arms[arm])
+    }
+
+    /// The protractor arm at `window_pos` for touch input, which is less precise than a pen or a
+    /// mouse: its handle, or the arm itself away from the center. With a finger the arms can't
+    /// be drawn along, so they can be grabbed anywhere.
+    pub fn hit_protractor_arm_touch_window(&self, window_pos: Vector2) -> Option<usize> {
+        if !self.visible || self.kind != RulerKind::Protractor {
+            return None;
+        }
+        let arm_len = self.tool_size + Self::PROTRACTOR_ARM_EXTENSION_PX;
+        (0..self.protractor_arms.len())
+            .filter_map(|arm| {
+                let handle_dist = (self.protractor_handle_pos(arm) - window_pos).length();
+                if handle_dist <= Self::PROTRACTOR_TOUCH_HANDLE_RADIUS_PX {
+                    return Some((arm, handle_dist));
+                }
+                let dir = self.protractor_arm_direction(self.protractor_arms[arm]);
+                let rel = window_pos - self.anchor;
+                let along = rel.dot(dir);
+                let dist = (rel - along * dir).length();
+                (along >= self.tool_size * 0.25
+                    && along <= arm_len
+                    && dist <= Self::PROTRACTOR_TOUCH_ARM_DISTANCE_PX)
+                    .then_some((arm, dist))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(arm, _)| arm)
     }
 
     /// The protractor arm whose handle is at `window_pos`, if any.
@@ -554,27 +585,38 @@ impl RulerConfig {
         -(((angle_rad + half_pi).rem_euclid(pi)) - half_pi)
     }
 
-    /// The angle as it is displayed in the dial, in degrees, see [`Self::normalize_angle`].
+    /// The angle as it is displayed in the dial, in degrees in `[0°, 360°)`, counterclockwise on
+    /// screen.
     pub fn displayed_angle_deg(&self) -> f64 {
-        Self::normalize_angle(self.angle).to_degrees()
+        (-self.angle.to_degrees()).rem_euclid(360.0)
     }
 
-    /// Rotate the ruler around the dial so that it displays `angle_deg`.
+    /// Rotate the ruler around its rotation center so that it displays `angle_deg`.
     ///
-    /// The dial stays where it is, so the ruler turns in place. Of the two stored angles that
-    /// describe the same line, the one closer to the current angle is picked so the tick pattern
-    /// does not flip around.
+    /// The rotation center stays where it is, so the ruler turns in place.
     pub fn set_displayed_angle_deg(&mut self, angle_deg: f64) {
-        let pi = std::f64::consts::PI;
+        // Of the stored angles for the same direction, the one closest to the current angle.
         let base = -angle_deg.to_radians();
-        let new_angle = base + ((self.angle - base) / pi).round() * pi;
+        let new_angle =
+            base + ((self.angle - base) / std::f64::consts::TAU).round() * std::f64::consts::TAU;
         let delta = new_angle - self.angle;
 
-        let v = self.anchor - self.dial_pos;
+        let pivot = self.rotation_center();
+        let v = self.anchor - pivot;
         let (sin_a, cos_a) = delta.sin_cos();
-        self.anchor =
-            self.dial_pos + Vector2::new(v.x * cos_a - v.y * sin_a, v.x * sin_a + v.y * cos_a);
+        self.anchor = pivot + Vector2::new(v.x * cos_a - v.y * sin_a, v.x * sin_a + v.y * cos_a);
+        self.dial_pos = pivot;
         self.angle = new_angle;
+    }
+
+    /// The point the ruler turns around: the dial of the ruler, the centroid of the set square
+    /// and the center of the protractor's base line.
+    pub fn rotation_center(&self) -> Vector2 {
+        match self.kind {
+            RulerKind::Ruler => self.dial_pos,
+            RulerKind::SetSquare => self.anchor + self.up() * self.tool_size / 3.0,
+            RulerKind::Protractor => self.anchor,
+        }
     }
 
     /// Whether `angle_rad` is essentially equal to one of the snap targets
@@ -725,12 +767,11 @@ mod tests {
         ruler.anchor = Vector2::new(100.0, 150.0);
         ruler.dial_pos = Vector2::new(200.0, 150.0);
 
-        for angle_deg in [37.5, -12.0, 90.0, -89.9, 0.0] {
+        for angle_deg in [37.5, 348.0, 90.0, 270.1, 180.0, 0.0] {
             ruler.set_displayed_angle_deg(angle_deg);
 
             assert!(
-                (ruler.displayed_angle_deg() - angle_deg).abs() < 1e-9
-                    || (angle_deg.abs() - 90.0).abs() < 1e-9,
+                (ruler.displayed_angle_deg() - angle_deg).abs() < 1e-9,
                 "set {angle_deg}, got {}",
                 ruler.displayed_angle_deg()
             );
@@ -799,6 +840,47 @@ mod tests {
         // Far away there is nothing to snap to.
         assert_eq!(snap(anchor + Vector2::new(0.0, 200.0)), None);
         assert_eq!(snap(anchor + Vector2::new(400.0, 20.0)), None);
+    }
+
+    #[test]
+    fn set_square_turns_around_its_centroid() {
+        let mut set_square = tool(RulerKind::SetSquare);
+        let [a, b, c] = set_square.set_square_corners();
+        let centroid = (a + b + c) / 3.0;
+        assert!((set_square.rotation_center() - centroid).length() < 1e-9);
+
+        for angle_deg in [30.0, 170.0, 225.0, 359.5, 0.0] {
+            set_square.set_displayed_angle_deg(angle_deg);
+            assert!(
+                (set_square.displayed_angle_deg() - angle_deg).abs() < 1e-9,
+                "set {angle_deg}, got {}",
+                set_square.displayed_angle_deg()
+            );
+            assert!((set_square.rotation_center() - centroid).length() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn protractor_arms_can_be_grabbed_by_touch() {
+        let mut protractor = tool(RulerKind::Protractor);
+        protractor.protractor_arms = [0.0, 90.0];
+        let anchor = protractor.anchor;
+        let up = Vector2::new(0.0, -1.0);
+
+        // Next to the handle, where a pen would miss it.
+        let near_handle = protractor.protractor_handle_pos(1) + Vector2::new(24.0, 0.0);
+        assert_eq!(protractor.hit_protractor_handle_window(near_handle), None);
+        assert_eq!(
+            protractor.hit_protractor_arm_touch_window(near_handle),
+            Some(1)
+        );
+        // Anywhere along the arm, but not at the center where both meet.
+        let on_arm = anchor + up * 120.0 + Vector2::new(10.0, 0.0);
+        assert_eq!(protractor.hit_protractor_arm_touch_window(on_arm), Some(1));
+        assert_eq!(protractor.hit_protractor_arm_touch_window(anchor), None);
+        // Away from the arms, the protractor itself is dragged.
+        let elsewhere = anchor + protractor.protractor_arm_direction(45.0) * 120.0;
+        assert_eq!(protractor.hit_protractor_arm_touch_window(elsewhere), None);
     }
 
     #[test]

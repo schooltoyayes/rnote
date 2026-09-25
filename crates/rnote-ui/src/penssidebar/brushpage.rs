@@ -488,8 +488,8 @@ impl RnBrushPage {
                         if visible {
                             ruler.kind = kind;
                             if kind != RulerKind::Ruler {
-                                // Turns around the middle of its long edge, see the dial.
-                                ruler.dial_pos = ruler.anchor;
+                                // The dial is where it turns around.
+                                ruler.dial_pos = ruler.rotation_center();
                             }
                         }
                         visible && ruler.anchor == p2d::math::Vector2::ZERO

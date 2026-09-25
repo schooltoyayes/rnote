@@ -116,8 +116,8 @@ fn rotate_ruler_with_scroll(
             .filter(|s| now.duration_since(s.last_event_time) < RULER_SCROLL_REVIVAL_TIMEOUT);
 
         let pivot = if ruler.kind != RulerKind::Ruler {
-            // The set square and the protractor turn around the middle of their long edge,
-            // when the pointer is on them or they are being turned already.
+            // The set square and the protractor turn around their rotation center, when
+            // the pointer is on them or they are being turned already.
             let turning = prev_session_raw.is_some_and(|s| {
                 now.duration_since(s.last_event_time) < RULER_SCROLL_SESSION_TIMEOUT
             });
@@ -128,8 +128,9 @@ fn rotate_ruler_with_scroll(
             if !turning && !on_body {
                 return false;
             }
-            ruler.dial_pos = ruler.anchor;
-            ruler.anchor
+            let pivot = ruler.rotation_center();
+            ruler.dial_pos = pivot;
+            pivot
         } else if let Some(session) = prev_session {
             // Within the short active-session timeout — definitely reuse.
             session.pivot
@@ -749,7 +750,8 @@ mod imp {
                             let config = config.read();
                             let ruler = &config.pens_config.brush_config.ruler_config;
                             let pos = Vector2::new(x, y);
-                            if let Some(arm) = ruler.hit_protractor_handle_window(pos) {
+                            // Mostly touch input, which can grab the protractor arms anywhere.
+                            if let Some(arm) = ruler.hit_protractor_arm_touch_window(pos) {
                                 CanvasDragMode::ProtractorArm(arm, pos)
                             } else if ruler.hit_body_window(pos) {
                                 CanvasDragMode::Ruler(ruler.anchor, ruler.dial_pos)
@@ -757,6 +759,16 @@ mod imp {
                                 CanvasDragMode::Canvas(canvas.engine_ref().camera.offset())
                             }
                         };
+                        tracing::debug!(
+                            x,
+                            y,
+                            mode = match mode {
+                                CanvasDragMode::Canvas(..) => "canvas",
+                                CanvasDragMode::Ruler(..) => "ruler",
+                                CanvasDragMode::ProtractorArm(..) => "protractor arm",
+                            },
+                            "Canvas drag begin"
+                        );
                         // For ruler drag, disable kinetic scrolling for the duration
                         // of the drag — otherwise the scroller's touch-pan can steal
                         // the sequence once the finger crosses its drag threshold and
@@ -1001,13 +1013,13 @@ mod imp {
                                     if all_on_body {
                                         // The ruler turns around the centroid projected onto
                                         // its centerline, the set square and the protractor
-                                        // around the middle of their long edge.
+                                        // around their rotation center.
                                         let projected = if ruler.kind == RulerKind::Ruler {
                                             let rel = bbcenter - ruler.anchor;
                                             let along = rel.dot(ruler.direction());
                                             ruler.anchor + along * ruler.direction()
                                         } else {
-                                            ruler.anchor
+                                            ruler.rotation_center()
                                         };
                                         Some((projected, ruler.anchor, ruler.angle))
                                     } else {

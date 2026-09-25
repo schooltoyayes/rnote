@@ -140,13 +140,14 @@
               <child>
                 <object class="AdwSpinRow" id="ruler_angle_row">
                   <property name="title" translatable="yes">Angle</property>
-                  <property name="subtitle" translatable="yes">Rotate the ruler around the angle dial to an exact angle (°)</property>
+                  <property name="subtitle" translatable="yes">Turn the ruler to an exact angle, counterclockwise from 0° to 359.9°</property>
                   <property name="digits">1</property>
                   <property name="numeric">true</property>
+                  <property name="wrap">true</property>
                   <property name="adjustment">
                     <object class="GtkAdjustment">
-                      <property name="lower">-90</property>
-                      <property name="upper">90</property>
+                      <property name="lower">0</property>
+                      <property name="upper">359.9</property>
                       <property name="step-increment">1</property>
                       <property name="page-increment">15</property>
                       <property name="value">0</property>

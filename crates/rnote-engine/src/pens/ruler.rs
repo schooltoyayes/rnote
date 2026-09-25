@@ -710,22 +710,18 @@ fn draw_angle_dial(
 
 /// The angle the ruler is turned by, as shown in the dial.
 fn rotation_text(ruler: &RulerConfig) -> String {
-    let normalized_deg = RulerConfig::normalize_angle(ruler.angle).to_degrees();
+    let normalized_deg = ruler.displayed_angle_deg();
     // Angles set in the angle row have at most one decimal, while turning the ruler by
-    // hand gives arbitrary angles. Show the decimal only for the former. Round first so
-    // `-0.3°` doesn't surface as `-0°`; then canonicalize the sign so `format!` doesn't
-    // print the negative zero.
+    // hand gives arbitrary angles. Show the decimal only for the former.
     let tenths = (normalized_deg * 10.0).round();
     let rounded = if (normalized_deg * 10.0 - tenths).abs() < 1e-3 {
         tenths / 10.0
     } else {
         normalized_deg.round()
     };
-    // Canonicalize: the displayed range is (-90°, 90°], so a rounded -90° is
-    // the same orientation as +90° — show +90°. Also avoid printing "-0°".
-    let display_value = if rounded == -90.0 {
-        90.0
-    } else if rounded == 0.0 {
+    // The displayed range is [0°, 360°), a rounded 360° is 0°. Also avoid printing the
+    // negative zero as "-0°".
+    let display_value = if rounded >= 360.0 || rounded == 0.0 {
         0.0
     } else {
         rounded
