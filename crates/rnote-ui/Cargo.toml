@@ -57,6 +57,9 @@ tracing-subscriber = { workspace = true }
 unicode-segmentation = { workspace = true }
 url = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true }
+
 [build-dependencies]
 anyhow = { workspace = true }
 glib-build-tools = { workspace = true }

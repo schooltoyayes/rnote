@@ -128,6 +128,8 @@ impl ObjectImpl for RnAppWindow {
         self.setup_overview();
         self.setup_split_view();
         self.setup_tabbar();
+        #[cfg(target_os = "windows")]
+        super::nativeframe::setup(&*obj);
     }
 
     fn dispose(&self) {

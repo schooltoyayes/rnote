@@ -2,6 +2,8 @@
 mod actions;
 mod appsettings;
 mod imp;
+#[cfg(target_os = "windows")]
+mod nativeframe;
 
 // Imports
 use crate::{
